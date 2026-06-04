@@ -605,7 +605,13 @@ def payload_to_anim(payload: dict) -> str | None:
 
 
 def read_payload() -> dict | None:
-    raw = sys.stdin.read()
+    # Read stdin as UTF-8 explicitly. On non-UTF-8 locales (e.g. Windows GBK)
+    # sys.stdin.read() mis-decodes multibyte payloads and breaks JSON parsing,
+    # silently dropping hook events (notably Stop -> happy).
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = sys.stdin.read()
     if not raw.strip():
         return None
     if os.environ.get("CLAWD_DEBUG"):
