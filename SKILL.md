@@ -48,6 +48,7 @@ Important scripts:
 
 ```text
 scripts/install_hooks.py       writes ~/.claude/settings.json
+scripts/clawd_hub_app.py       shared background UI controller
 scripts/claude_clawd_hook.py   handles Claude Code hook payloads
 scripts/clawd_status_hub.py    visual relay and transport owner
 ```
@@ -80,6 +81,20 @@ Runtime state and logs:
    python skills/claude-clawd-status/scripts/install_hooks.py
    ```
 
+   The installer also creates or updates this Windows Startup shortcut:
+
+   ```text
+   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Clawd Hub App.lnk
+   ```
+
+   The shortcut starts `clawd_hub_app.py --minimized` at login, so the shared
+   Hub UI can stay available in the background. To install hooks without
+   changing Startup entries, run:
+
+   ```powershell
+   python scripts/install_hooks.py --no-startup
+   ```
+
 3. Restart active Claude Code sessions so hook settings are reloaded.
 
 4. Verify `~/.claude/settings.json` contains commands pointing at:
@@ -90,7 +105,26 @@ Runtime state and logs:
 
 ## Daily Start
 
+After installation on Windows, the Hub UI controller is started automatically
+at login from the `Clawd Hub App.lnk` Startup shortcut.
+
 Claude hooks can auto-start the Hub, but the most predictable daily setup is to keep Hub running before opening Claude Code.
+
+Start the shared background UI controller:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.claude\skills\claude-clawd-status\scripts\clawd_hub_app.py",
+    "--minimized"
+  ) `
+  -WindowStyle Hidden
+```
+
+The UI controller keeps Hub alive, shows module status, opens the dashboard,
+and can restart Hub, the Codex watcher, or BLE. If `pystray` is installed it
+can stay in the Windows system tray; without `pystray` it falls back to Tkinter
+minimize behavior.
 
 Start the shared Hub:
 

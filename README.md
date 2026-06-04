@@ -24,9 +24,31 @@ Claude Code hooks
 C:\Python314\python.exe C:\Users\admin\.claude\skills\claude-clawd-status\scripts\install_hooks.py
 ```
 
+The installer writes Claude hooks and creates or updates the Windows Startup
+shortcut `Clawd Hub App.lnk`, which starts `clawd_hub_app.py --minimized` at
+login. Use `--no-startup` if you only want to refresh hook entries.
+
 Then restart Claude Code so hook settings are reloaded.
 
 ## Daily Start
+
+On Windows this is normally automatic after install because the Startup
+shortcut launches the background UI controller at login.
+
+Start the shared background UI controller:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.claude\skills\claude-clawd-status\scripts\clawd_hub_app.py",
+    "--minimized"
+  ) `
+  -WindowStyle Hidden
+```
+
+The UI controller keeps Hub alive, provides restart buttons, and opens the
+dashboard. If `pystray` is installed it lives in the system tray; otherwise it
+uses a small Tkinter window.
 
 Start the shared Hub:
 
