@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 import argparse
 from pathlib import Path
@@ -65,9 +66,23 @@ $sc.WindowStyle = 7
 $sc.Description = 'Start Clawd Hook Hub background UI'
 $sc.Save()
 """
-    import subprocess
     subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
     return shortcut
+
+
+def launch_hub_app(app_script: Path) -> None:
+    """Start clawd_hub_app.py --minimized as a detached background process."""
+    pythonw = pythonw_path()
+    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([str(pythonw), str(app_script), "--minimized"], **kwargs)
+        print("Started Clawd Hub App.")
+    except Exception as exc:
+        print(f"Could not start Clawd Hub App: {exc}")
 
 
 def hook_entry(command: str, event: str) -> dict:
@@ -122,12 +137,15 @@ def install(install_startup: bool = True) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     print(f"Installed Clawd hooks in {SETTINGS_PATH}")
     print(f"Command: {command}")
+
     if install_startup:
         shortcut = install_startup_shortcut(app_script)
         if shortcut:
             print(f"Installed Clawd Hub startup shortcut: {shortcut}")
     else:
         print("Skipped Clawd Hub startup shortcut.")
+
+    launch_hub_app(app_script)
 
 
 if __name__ == "__main__":
