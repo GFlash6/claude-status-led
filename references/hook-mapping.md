@@ -1,21 +1,26 @@
 # Hook Mapping Reference
 
-The hook script accepts JSON on stdin. It expects Claude Code-style fields, but uses defensive fallbacks so small schema changes do not break status reporting.
+The hook script accepts one JSON object on stdin. It expects Claude Code hook fields and keeps defensive fallbacks for nearby Claude-style names where harmless.
 
-Common fields:
+Common Claude Code fields:
 
-- `hook_event_name`: event name such as `PreToolUse`, `Stop`, `Notification`
-- `session_id`: Claude Code session identifier
-- `tool_name` or `toolName`: tool name for `PreToolUse` / `PostToolUse`
-- `notification_type`: commonly `idle_prompt`
+- `hook_event_name`: event name such as `PreToolUse`, `PermissionRequest`, `PostToolUse`, or `Stop`
+- `session_id`: current Claude Code session identifier
+- `turn_id`: current turn identifier when supplied by the host
+- `tool_name`: canonical tool name for tool events
+- `tool_input`: tool-specific input, such as a Bash command or `apply_patch` command
 - `cwd`: current project path
-- `agent_id`: subagent identifier for subagent hooks
+- `model`: active model slug
+- `permission_mode`: `default`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`
+- `agent_id` / `agent_type`: subagent identifiers for subagent hooks
 
-Animation endpoint:
+Device command:
 
 ```text
-GET http://192.168.4.1/anim?id=<animation>
+{"auto":false,"anim":"<animation>"}
 ```
+
+The command is sent as newline-terminated JSON over BLE Nordic UART or serial.
 
 Supported firmware animations:
 
@@ -25,52 +30,85 @@ beacon, confused, sweeping, walking, going_away, alert, happy, sleeping,
 dizzy, disconnected
 ```
 
-## Event → Animation Mapping
-
-Aligned with clawd-tank-master authoritative spec (docs/superpowers/specs/, host/clawd_tank_daemon/).
+## Event to Animation Mapping
 
 | Claude Code event | Animation | Notes |
 | --- | --- | --- |
-| `SessionStart` | `idle` | Session registered, not yet active |
+| `SessionStart` | `idle` | Session registered and waiting for work; configurable with `CLAWD_TANK_IDLE_ANIM` |
 | `UserPromptSubmit` | `thinking` | Claude starts reasoning before tools |
-| `PreToolUse` (permission_mode = bypassPermissions) | tool-specific | All tools auto-approved; show what's running |
-| `PreToolUse` (any other permission_mode) | `confused` | Tool may need user approval before running |
-| `PostToolUse` | `thinking` | Tool ran; Claude processes result |
-| `PreCompact` | `sweeping` | Context compaction (oneshot in full impl) |
-| `Notification` (any type) | `confused` | Waiting for user; idle_prompt = 60s+ idle |
+| `PreToolUse` | tool-specific | Show the supported tool that is about to run |
+| `PermissionRequest` | `confused` | Claude is waiting for approval |
+| `PostToolUse` | `thinking` | Tool finished; Claude is reading results and deciding the next step |
+| `PreCompact` | `sweeping` | Context compaction is about to start |
+| `PostCompact` | `thinking` | Compaction finished; Claude resumes processing |
 | `SubagentStart` | `conducting` | Subagent spawned; overrides current tool |
 | `SubagentStop` | `thinking` | Subagent done, back to processing |
-| `Stop` | `alert` | Claude finished turn; oneshot in full impl |
-| `StopFailure` | `dizzy` | API or auth error |
-| `SessionEnd` | `going_away` | Session closing; oneshot in full impl |
+| `Stop` | `happy` | Claude finished the turn; configurable with `CLAWD_TANK_COMPLETE_ANIM`, then timed `idle` and `sleeping` |
+| `StopFailure` | `dizzy` | Claude stopped because of a failure |
+| `Notification` | `confused` | Claude requires attention |
+| `SessionEnd` | `going_away` | Claude session ended |
 
-## Tool → Animation Mapping
+## Tool to Animation Mapping
 
-Based on `TOOL_ANIMATION_MAP` in clawd_tank_daemon/daemon.py, extended with additional tools.
+The animation semantics follow the Claude mapping, but Codex tool names are often
+namespaced. The hook checks both the full Codex name and the final leaf name, so
+`functions.shell_command` and `shell_command` resolve the same way.
 
 | Tool category | Tools | Animation |
 | --- | --- | --- |
-| Edit | `Edit`, `Write`, `MultiEdit`, `NotebookEdit` | `typing` |
-| Debug / search | `Read`, `Grep`, `Glob`, `LS` | `debugger` |
-| Build / shell | `Bash`, `Shell`, `PowerShell` | `building` |
-| Web | `WebFetch`, `WebSearch` | `wizard` |
+| Edit | Claude: `Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex: `apply_patch`, `functions.apply_patch` | `typing` |
+| Debug / read / inspect | Claude: `Read`, `Grep`, `Glob`, `LS`; Codex: `view_image`, `functions.view_image`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` | `debugger` |
+| Build / shell / execution | Claude: `Bash`, `Shell`, `PowerShell`; Codex: `shell_command`, `functions.shell_command`, `js`, `mcp__node_repl.js` | `building` |
+| Web / generated media | Claude: `WebFetch`, `WebSearch`; Codex: `web.run`, `imagegen`, `image_gen.imagegen` | `wizard` |
 | Agent | `Task`, `Agent`, `Subagent` | `conducting` |
-| Task management | `TodoWrite`, `TodoRead` | `juggling` |
-| Ask user | `AskUserQuestion`, `AskFollowup` | `confused` |
-| MCP / LSP (name hint) | tools containing `mcp`, `lsp`, `language`, `context` | `beacon` |
-| Unknown | anything else | `typing` (spec fallback) |
+| Task / goal management | Claude: `TodoWrite`, `TodoRead`; Codex: `update_plan`, `get_goal`, `create_goal`, `update_goal` | `juggling` |
+| Ask user | Claude: `AskUserQuestion`, `AskFollowup`; Codex: `request_user_input` | `confused` |
+| MCP / LSP name hint | names containing `mcp`, `lsp`, `language`, or `context` | `beacon` |
+| Parallel tool wrapper | `multi_tool_use.parallel` | nested tools if unambiguous, otherwise `juggling` |
+| Unknown | anything else | `typing` |
 
-## Unused animations (hook script)
+Codex tool aliases are retained so the Claude and Codex bridges classify shared and namespaced tools consistently.
+
+## Unused Animations
 
 | Animation | Reason |
 | --- | --- |
-| `happy` | Oneshot for notification dismissal; requires state tracking not available in single-hook model. Appears in device auto-cycle. |
-| `sleeping` | Triggered by daemon staleness timeout (no sessions for >10 min); not a hook event. |
-| `walking` | Placeholder sprite (renders idle sprite); reserved for future multi-session transitions. |
-| `disconnected` | Firmware-autonomous on BLE drop; not sent by hook. |
+| `alert` | Available through `CLAWD_TANK_COMPLETE_ANIM=alert`, but default completion is `happy` |
+| `walking` | Placeholder sprite; reserved for future multi-session transitions |
+| `disconnected` | Firmware-autonomous on BLE drop; not sent by hook |
 
-## Oneshot behavior note
+## Timed Stop Behavior
 
-In the full clawd-tank-master implementation, `alert`, `happy`, `sweeping`, and `going_away` are oneshot animations that play once then return to a fallback state. In this simplified direct-send bridge, they stay displayed until the next hook event overwrites them. The effect is similar since hook events follow quickly in normal usage.
+```text
+Stop -> happy (10s) -> idle (30s) -> sleeping
+             -> any new event cancels the pending timer
+```
+
+Lifecycle defaults can be customized before Claude Code starts:
+
+```powershell
+$env:CLAWD_TANK_COMPLETE_ANIM = "happy"
+$env:CLAWD_TANK_IDLE_ANIM = "idle"
+$env:CLAWD_TANK_SLEEP_ANIM = "sleeping"
+$env:CLAWD_TANK_COMPLETE_SECONDS = "10"
+$env:CLAWD_TANK_IDLE_SECONDS = "30"
+```
 
 The script turns off ESP auto-cycle (`/auto?on=0`) before sending explicit status so manual state is not overridden by the firmware's own cycling.
+
+## VS Code Session Watcher
+
+If a session has `originator: codex_vscode` or `originator: Codex Desktop`, it
+may record `response_item` tool events in `~/.codex/sessions/**/*.jsonl`
+without invoking `~/.codex/hooks.json`. `scripts/codex_session_watch.py` tails
+the newest JSONL stream, switches as newer sessions appear, and maps:
+
+| Session JSONL event | Animation |
+| --- | --- |
+| `event_msg` `user_message` | `thinking` |
+| `response_item` `function_call` / `custom_tool_call` | tool-specific |
+| `response_item` `function_call_output` / `custom_tool_call_output` | `thinking` |
+| `event_msg` `task_complete` | completion animation, then timed idle/sleeping |
+
+`clawd_hub_app.py` keeps this optional watcher running alongside the Hub. It can
+also be launched directly with `codex_session_watch.py --follow-latest`.

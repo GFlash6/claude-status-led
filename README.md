@@ -1,52 +1,69 @@
 # Claude Clawd Status
 
-Claude Code status bridge for the Clawd Mochi Tank ESP32 display.
+Claude Code status bridge for the Clawd Mochi Tank ESP32 display, kept at
+feature parity with the Codex bridge.
 
 ---
 
 ## Architecture
 
 ```text
-Claude Code (settings.json hooks)
-  │  11 events: SessionStart, UserPromptSubmit, PreToolUse,
-  │             PostToolUse, Notification, PreCompact,
-  │             Stop, StopFailure, SessionEnd,
-  │             SubagentStart, SubagentStop
-  ▼
-claude_clawd_hook.py          reads JSON payload from stdin,
-                               maps event+tool → animation name
-  │
-  ▼ POST http://127.0.0.1:8765/hook
-clawd_status_hub.py           Hook Hub — receives deliveries,
-                               records state, drives transport
-  │
-  ├─── BLE Nordic UART ──────► ESP32 (Claude-Mochi-Tank)
-  └─── CH340/ESP32 serial ───► ESP32 (COM11 or auto-detected)
+Claude Code (settings.json native hooks)          Codex VS Code / Desktop
+  │  13 events: SessionStart,                  │  writes session JSONL to
+  │  UserPromptSubmit, PreToolUse,             │  ~/.codex/sessions/**/*.jsonl
+  │  PermissionRequest, PostToolUse,           │
+  │  PreCompact, PostCompact, Stop,            ▼
+  │  StopFailure, Notification, SessionEnd,  codex_session_watch.py
+  │  SubagentStart, SubagentStop
+  │                                            tails newest session file,
+  ▼                                            maps items → animations
+claude_clawd_hook.py
+  reads JSON payload from stdin,
+  maps event+tool → animation name
+  │                                            │
+  └─────────────────┬───────────────────────── ┘
+                    │ POST http://127.0.0.1:8765/hook
+                    ▼
+          clawd_status_hub.py         Hook Hub — receives deliveries,
+                                       records state, drives transport
+                    │
+                    ├─── BLE Nordic UART ──────► ESP32 (Claude-Mochi-Tank)
+                    └─── CH340/ESP32 serial ───► ESP32 (auto-detected)
 
-clawd_hub_app.py              Background UI controller.
-                               Keeps Hub alive, shows module
-                               status, restartable from tray/window.
+          clawd_hub_app.py            Background UI controller.
+                                       Keeps Hub and watcher alive,
+                                       restartable from tray/window.
 ```
 
-The Hub owns the ESP32 connection and provides a live dashboard at
-`http://127.0.0.1:8765`. Multiple agents (Claude Code, Codex) can
-share one Hub on port 8765.
+Two input paths feed the same Hub:
+
+- **Native hooks** (`claude_clawd_hook.py`) — fired by Claude Code when
+  `~/.claude/settings.json` is configured. Client ID: `claude-code`.
+- **Session watcher** (`codex_session_watch.py`) — tails the newest
+  JSONL session file written by Codex VS Code or Codex Desktop.
+  Client ID: `codex-vscode`, `codex-desktop`, or `codex-watch`.
+
+Both paths are independent. CLI users typically only need native hooks.
+VS Code / Desktop users need the watcher (native hooks may not fire there).
+
+The Hub shares port 8765 with the Claude Code skill. Only one Hub process
+should run at a time.
 
 ---
 
 ## Is This Skill For You?
 
-This skill targets **Claude Code** — the Anthropic CLI that stores
-hook configuration in `~/.claude/settings.json`.
+This skill targets **Claude Code** — the tool that stores hook
+configuration in `~/.claude/settings.json`.
 
 **You are the right agent if:**
 
-- You are Claude Code (`claude` CLI / VSCode extension / desktop app).
+- You use Claude Code; the bundled watcher can additionally observe Codex VS Code or Codex Desktop sessions.
 - Your hook config file is `%USERPROFILE%\.claude\settings.json`.
 
 **You are a different agent if:**
 
-- You are OpenAI Codex CLI → use the `codex-clawd-status` skill instead.
+- You are Codex CLI only → use the `codex-clawd-status` skill instead.
 - You are another LLM tool, CI runner, or custom agent → see
   [Adapt For Any Agent](#adapt-for-any-agent) below.
 
@@ -85,29 +102,24 @@ C:\Python314\python.exe `
   "$env:USERPROFILE\.claude\skills\claude-clawd-status\scripts\install_hooks.py"
 ```
 
-The installer also creates a Windows Startup shortcut (`Clawd Hub App.lnk`)
-so the Hub UI starts automatically at login. Use `--no-startup` to skip:
+**Step 3** — The installer immediately launches `clawd_hub_app.py --minimized`
+in the background and creates a Windows Startup shortcut so the UI starts
+automatically at every login. Use `--no-startup` to skip the shortcut:
 
 ```powershell
 ... install_hooks.py --no-startup
 ```
 
-**Step 3** — The installer immediately launches `clawd_hub_app.py --minimized`
-in the background. The Hub starts automatically from there.
-
-**Step 4 — restart Claude Code** so the new hook settings are loaded.
+**Step 4 — restart Claude Code** so the updated settings and hooks are loaded.
 
 **Step 5 — verify** `~/.claude/settings.json` contains entries pointing at
-`claude_clawd_hook.py` for each of the 11 hook events.
+`claude_clawd_hook.py` for each configured hook event.
 
 ---
 
 ## Daily Start
 
-After install, the Windows Startup shortcut handles Hub launch at login.
-To start manually:
-
-**UI controller** (keeps Hub alive, shows module status, system tray):
+Start the **UI controller** (keeps Hub and watcher alive, system tray):
 
 ```powershell
 Start-Process -FilePath "C:\Python314\python.exe" `
@@ -117,7 +129,7 @@ Start-Process -FilePath "C:\Python314\python.exe" `
   ) -WindowStyle Hidden
 ```
 
-**Hub** (animation router and ESP32 transport owner):
+Start the **Hub** (animation router and ESP32 transport owner):
 
 ```powershell
 Start-Process -FilePath "C:\Python314\python.exe" `
@@ -127,10 +139,24 @@ Start-Process -FilePath "C:\Python314\python.exe" `
   ) -WindowStyle Hidden
 ```
 
+Start the **session watcher** (required for VS Code / Desktop sessions):
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "$env:USERPROFILE\.claude\skills\claude-clawd-status\scripts\codex_session_watch.py",
+    "--follow-latest"
+  ) -WindowStyle Hidden
+```
+
 Dashboard: `http://127.0.0.1:8765`
 
-If Codex is already running a Hub on port 8765, reuse it — do not
+If Claude Code is already running a Hub on port 8765, reuse it — do not
 start a second Hub.
+
+The hook script auto-starts the Hub. The UI controller keeps both the Hub and
+the optional Codex session watcher alive; start the watcher manually when the
+UI controller is not running.
 
 ---
 
@@ -149,31 +175,46 @@ C:\Python314\python.exe `
 
 # Check Hub state:
 Invoke-RestMethod http://127.0.0.1:8765/state
+
+# Check running Hub and watcher processes:
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like '*clawd_status_hub.py*' `
+              -or $_.CommandLine -like '*codex_session_watch.py*' } |
+  Select-Object ProcessId, CommandLine
 ```
 
 ---
 
 ## Event → Animation Mapping
 
-| Claude Code event | Animation |
+| Claude Code event or session item | Animation |
 | --- | --- |
 | `SessionStart` | `idle` |
-| `UserPromptSubmit` | `thinking` |
+| `UserPromptSubmit` or session `user_message` | `thinking` |
+| session `agent_message` | `thinking` |
 | `PreToolUse` — shell/Bash/PowerShell | `building` |
-| `PreToolUse` — Edit/Write/MultiEdit/NotebookEdit | `typing` |
-| `PreToolUse` — Read/Grep/Glob/LS | `debugger` |
-| `PreToolUse` — WebFetch/WebSearch | `wizard` |
+| `PreToolUse` — Edit/Write/apply_patch | `typing` |
+| `PreToolUse` — Read/Grep/Glob/search | `debugger` |
+| `PreToolUse` — web/image generation | `wizard` |
 | `PreToolUse` — Task/Agent/Subagent | `conducting` |
-| `PreToolUse` — TodoWrite/TodoRead | `juggling` |
-| `PreToolUse` — AskUserQuestion | `confused` |
-| `Notification` (permission/wait) | `alert` or `confused` |
-| `PostToolUse` | tool-specific or `thinking` |
+| `PreToolUse` — plan management | `juggling` |
+| `PermissionRequest` | `confused` |
+| `PostToolUse` or function output | `thinking` |
 | `PreCompact` | `sweeping` |
-| `Stop` | `happy` → `idle` → `sleeping` |
-| `StopFailure` | `dizzy` |
-| `SessionEnd` | `going_away` |
+| `PostCompact` | `thinking` |
+| `Stop` or session `task_complete` | `happy` → `idle` → `sleeping` |
 | `SubagentStart` | `conducting` |
 | `SubagentStop` | `thinking` |
+
+Lifecycle timing after task completion is configurable:
+
+```powershell
+$env:CLAWD_TANK_COMPLETE_ANIM    = "happy"
+$env:CLAWD_TANK_IDLE_ANIM        = "idle"
+$env:CLAWD_TANK_SLEEP_ANIM       = "sleeping"
+$env:CLAWD_TANK_COMPLETE_SECONDS = "10"
+$env:CLAWD_TANK_IDLE_SECONDS     = "30"
+```
 
 ---
 
@@ -198,14 +239,44 @@ Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 
 ---
 
+## Client IDs on the Dashboard
+
+| Client ID | Source |
+| --- | --- |
+| `claude-code` | Claude Code native hook events |
+| `codex-vscode` | Session watcher, `originator=codex_vscode` |
+| `codex-desktop` | Session watcher, `originator=Codex Desktop` |
+| `codex-watch` | Session watcher fallback |
+| `manual` | Hub dashboard buttons |
+
+Override native hook ID:
+
+```powershell
+$env:CLAWD_TANK_CLIENT_ID = "my-claude"
+```
+
+Override watcher fallback ID:
+
+```powershell
+$env:CLAWD_TANK_WATCH_CLIENT_ID = "my-codex-watch"
+```
+
+---
+
 ## Troubleshooting
 
-**Hub page shows no Claude events:**
+**Hub page shows no events:**
 
 1. `Invoke-RestMethod http://127.0.0.1:8765/health` — is Hub running?
-2. Check `~/.claude/settings.json` has `claude_clawd_hook.py` entries.
-3. Restart Claude Code after changing hook settings.
-4. Read `~/.clawd-mochi/status-hook.log`.
+2. For VS Code / Desktop: check the watcher process is running.
+3. For CLI: check `~/.claude/settings.json` points to `claude_clawd_hook.py`.
+4. Restart Claude Code so it reloads `settings.json`.
+5. Read `~/.clawd-mochi/status-hook.log`.
+
+**Wrong source shown (e.g. `codex-watch` instead of `codex-vscode`):**
+
+1. Check the first line of the current session JSONL for `originator`.
+2. Restart `codex_session_watch.py --follow-latest` after script updates.
 
 **Events in Hub but ESP32 does not change:**
 
@@ -224,9 +295,9 @@ Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 
 ## Adapt For Any Agent
 
-If you are **not** Claude Code but you want your agent's activity to
-appear on the Clawd display, you only need to POST to the Hub. The
-hook scripts and `install_hooks.py` are not required.
+If you are **not** Codex but you want your agent's activity to appear on
+the Clawd display, you only need to POST to the Hub. The hook scripts and
+`install_hooks.py` are not required.
 
 ### Step 1 — Ensure the Hub is running
 
@@ -289,24 +360,27 @@ req = urllib.request.Request(
     data=json.dumps({"anim": "thinking", "client_id": "my-agent"}).encode(),
     headers={"Content-Type": "application/json"},
 )
-urllib.request.urlopen(req, timeout=5)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+opener.open(req, timeout=5)
 ```
 
 ### Step 3 — Wire into your platform's hook system
 
 Most agent platforms let you run a shell command when events fire.
-The simplest approach is a small wrapper script that receives the
-event context and calls the Hub:
+Write a small shim that maps your platform's event names to animation
+names and POSTs to the Hub:
 
 ```python
 #!/usr/bin/env python3
 """Minimal hook shim for any agent platform.
 
-Receive event JSON on stdin (or as argv), map to an animation,
-POST to Hub. Exit 0 always so the agent is never blocked.
+Receive event JSON on stdin, map to an animation, POST to Hub.
+Exit 0 always so the agent is never blocked.
 """
 import json, sys, urllib.request
 
+# Map your platform's event names to Clawd animations.
+# Adjust this table to match your agent's event vocabulary.
 EVENT_TO_ANIM = {
     "work_start": "thinking",
     "tool_use":   "building",
@@ -321,7 +395,7 @@ EVENT_TO_ANIM = {
 def post(anim: str, event: str = "", tool: str = "") -> None:
     body = json.dumps({
         "anim": anim,
-        "client_id": "my-agent",
+        "client_id": "my-agent",   # change to your agent name
         "event": event,
         "tool": tool,
     }).encode()
@@ -346,17 +420,22 @@ except Exception:
     pass
 ```
 
-Save this as `my_agent_hook.py`, then register it in your platform
-however hooks are configured. The key contract:
+Save this as `my_agent_hook.py`, make it executable, and register it
+in your platform's hook configuration as a command that receives event
+JSON on stdin. The key contract:
 
-- The script reads event context from stdin (or any other source).
-- It calls `POST /hook` with `anim` + metadata.
-- It always exits 0.
+- The script reads event context from stdin (adapt if your platform uses argv or env).
+- It POSTs `{"anim": ..., "client_id": ..., "event": ..., "tool": ...}` to Hub.
+- It always exits 0 — display failures must never block the agent.
+
+If your platform does not support stdin-based hooks, read the event
+context from whatever source is available (env vars, a temp file, argv)
+and build the same POST body.
 
 ### Step 4 — Verify on the dashboard
 
-Open `http://127.0.0.1:8765` and confirm your `client_id` appears
-in the Clients table and the animation changes when your agent is active.
+Open `http://127.0.0.1:8765` and confirm your `client_id` appears in
+the Clients table and the animation changes when your agent is active.
 
 ---
 
@@ -364,13 +443,14 @@ in the Clients table and the animation changes when your agent is active.
 
 ```text
 scripts/
-  install_hooks.py        writes ~/.claude/settings.json hooks
-  claude_clawd_hook.py    Claude Code hook payload → animation → Hub
-  clawd_status_hub.py     Hub: HTTP server, transport owner, dashboard
-  clawd_hub_app.py        background UI controller (tray / Tkinter)
+  install_hooks.py          writes ~/.claude/settings.json
+  claude_clawd_hook.py       Claude Code native hook payload → animation → Hub
+  codex_session_watch.py    tails ~/.codex/sessions/**/*.jsonl → Hub
+  clawd_status_hub.py       Hub: HTTP server, transport owner, dashboard
+  clawd_hub_app.py          background UI controller (tray / Tkinter)
 references/
-  hook-mapping.md         low-level payload field assumptions
-SKILL.md                  full reference for Claude Code agents
+  hook-mapping.md           low-level payload field assumptions
+SKILL.md                    full reference for Claude Code agents
 ```
 
 Logs and runtime state: `%USERPROFILE%\.clawd-mochi\`

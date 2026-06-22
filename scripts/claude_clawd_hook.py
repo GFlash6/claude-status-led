@@ -2,8 +2,8 @@
 """Claude Code hook -> Clawd Mochi Tank animation bridge.
 
 Reads a Claude Code hook payload from stdin, maps it to an animation, and sends
-an HTTP request to the ESP32 firmware. Failures are best-effort and exit 0 so
-Claude Code is never interrupted by display/network issues.
+it to the ESP32 firmware by BLE or serial. Failures are best-effort and exit 0
+so Claude Code is never interrupted by display/network issues.
 """
 
 from __future__ import annotations
@@ -14,37 +14,65 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
-DEFAULT_URL = "http://192.168.4.1"
 DEFAULT_BAUD = 115200
 DEFAULT_BLE_NAME = "Claude-Mochi-Tank"
 CH340_VID = 0x1A86  # WCH CH340/CH341 USB-serial adapter
+ESPRESSIF_USB_VID = 0x303A
 BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 LOG_DIR = Path.home() / ".clawd-mochi"
 LOG_PATH = LOG_DIR / "status-hook.log"
 LAST_EVENT_PATH = LOG_DIR / "last_event"
 HUB_PID_PATH = LOG_DIR / "status-hub.pid"
+HUB_START_LOCK_PATH = LOG_DIR / "status-hub.start.lock"
 DEFAULT_HUB_URL = "http://127.0.0.1:8765"
 DEFAULT_CLIENT_ID = "claude-code"
 NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+SERIAL_LOCK = threading.Lock()
 
-# Delays for idle → sleeping auto-transition after Stop
-HAPPY_DURATION_S = 10
-IDLE_DURATION_S  = 30
 
-EDIT_TOOLS   = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-DEBUG_TOOLS  = {"Read", "Grep", "Glob", "LS"}
-BUILD_TOOLS  = {"Bash", "Shell", "PowerShell"}
-WEB_TOOLS    = {"WebFetch", "WebSearch"}
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Lifecycle animations. These mirror the Claude mapping by default:
+# task complete -> idle -> sleeping, with any new activity cancelling the timer.
+SESSION_IDLE_ANIM = os.environ.get("CLAWD_TANK_IDLE_ANIM", "idle")
+TASK_COMPLETE_ANIM = os.environ.get("CLAWD_TANK_COMPLETE_ANIM", "happy")
+SLEEP_ANIM = os.environ.get("CLAWD_TANK_SLEEP_ANIM", "sleeping")
+COMPLETE_DURATION_S = env_float("CLAWD_TANK_COMPLETE_SECONDS", 10.0)
+IDLE_DURATION_S = env_float("CLAWD_TANK_IDLE_SECONDS", 30.0)
+
+EDIT_TOOLS   = {
+    "Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch",
+    "functions.apply_patch",
+}
+DEBUG_TOOLS  = {
+    "Read", "Grep", "Glob", "LS", "view_image", "functions.view_image",
+    "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+    "functions.list_mcp_resources", "functions.list_mcp_resource_templates",
+    "functions.read_mcp_resource",
+}
+BUILD_TOOLS  = {
+    "Bash", "Shell", "PowerShell", "shell_command", "functions.shell_command",
+    "js", "mcp__node_repl.js",
+}
+WEB_TOOLS    = {"WebFetch", "WebSearch", "web.run", "imagegen", "image_gen.imagegen"}
 AGENT_TOOLS  = {"Task", "Agent", "Subagent"}
-MANAGE_TOOLS = {"TodoWrite", "TodoRead"}
-ASK_TOOLS    = {"AskUserQuestion", "AskFollowup"}
+MANAGE_TOOLS = {
+    "TodoWrite", "TodoRead", "update_plan", "get_goal", "create_goal", "update_goal",
+    "functions.update_plan", "functions.get_goal", "functions.create_goal", "functions.update_goal",
+}
+ASK_TOOLS    = {"AskUserQuestion", "AskFollowup", "request_user_input", "functions.request_user_input"}
 BEACON_HINTS = ("mcp", "lsp", "language", "context")
 
 
@@ -109,6 +137,32 @@ def read_hub_pid() -> int:
         return 0
 
 
+def acquire_start_lock(path: Path, stale_seconds: float = 10.0) -> bool:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time():.6f}\n")
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - path.stat().st_mtime > stale_seconds:
+                path.unlink(missing_ok=True)
+                return acquire_start_lock(path, stale_seconds)
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+
+
+def release_start_lock(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def hub_url(cli_url: str | None = None) -> str:
     return (cli_url or os.environ.get("CLAWD_TANK_HUB_URL") or DEFAULT_HUB_URL).rstrip("/")
 
@@ -133,6 +187,67 @@ def hub_required(args: argparse.Namespace | None = None) -> bool:
     return os.environ.get("CLAWD_TANK_HUB_REQUIRED", "1").lower() not in {"0", "false", "no", "off"}
 
 
+def ensure_hub(args: argparse.Namespace) -> None:
+    if not hub_enabled(args):
+        return
+    if ping_hub(args.hub_url):
+        return
+    pid = read_hub_pid()
+    if pid_is_running(pid):
+        return
+    if not acquire_start_lock(HUB_START_LOCK_PATH):
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if ping_hub(args.hub_url):
+                return
+            time.sleep(0.15)
+        log("hub autostart skipped; start lock is active")
+        return
+
+    try:
+        if ping_hub(args.hub_url):
+            return
+        hub = Path(__file__).with_name("clawd_status_hub.py")
+        if not hub.exists():
+            log(f"hub autostart skipped; missing {hub}")
+            return
+
+        cmd = [sys.executable, str(hub)]
+        if args.transport:
+            cmd += ["--transport", args.transport]
+        if args.port:
+            cmd += ["--serial-port", args.port]
+        if args.baud is not None:
+            cmd += ["--baud", str(args.baud)]
+        if args.ble_address:
+            cmd += ["--ble-address", args.ble_address]
+        if args.ble_name:
+            cmd += ["--ble-name", args.ble_name]
+
+        kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x08000000
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            HUB_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
+            log(f"hub autostarted pid={proc.pid}")
+        except Exception as exc:
+            log(f"hub autostart failed: {exc}")
+            return
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if ping_hub(args.hub_url):
+                return
+            time.sleep(0.15)
+    finally:
+        release_start_lock(HUB_START_LOCK_PATH)
+
+
 def ping_hub(cli_url: str | None = None) -> bool:
     try:
         with hub_urlopen(hub_url(cli_url) + "/health", timeout=0.4) as resp:
@@ -141,61 +256,15 @@ def ping_hub(cli_url: str | None = None) -> bool:
         return False
 
 
-def ensure_hub(args: argparse.Namespace) -> None:
-    if not hub_enabled(args) or ping_hub(args.hub_url):
-        return
-    pid = read_hub_pid()
-    if pid_is_running(pid):
-        return
-
-    hub = Path(__file__).with_name("clawd_status_hub.py")
-    if not hub.exists():
-        log(f"hub autostart skipped; missing {hub}")
-        return
-
-    cmd = [sys.executable, str(hub)]
-    if args.transport:
-        cmd += ["--transport", args.transport]
-    if args.port:
-        cmd += ["--serial-port", args.port]
-    if args.baud is not None:
-        cmd += ["--baud", str(args.baud)]
-    if args.ble_address:
-        cmd += ["--ble-address", args.ble_address]
-    if args.ble_name:
-        cmd += ["--ble-name", args.ble_name]
-
-    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x08000000
-    else:
-        kwargs["start_new_session"] = True
-
-    try:
-        proc = subprocess.Popen(cmd, **kwargs)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        HUB_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
-        log(f"hub autostarted pid={proc.pid}")
-    except Exception as exc:
-        log(f"hub autostart failed: {exc}")
-        return
-
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        if ping_hub(args.hub_url):
-            return
-        time.sleep(0.15)
-
-
 def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = None, event_time: float | None = None) -> bool:
     ensure_hub(args)
-    event = (payload.get("hook_event_name") or payload.get("event")) if payload else ""
-    tool = (payload.get("tool_name") or payload.get("toolName")) if payload else ""
+    event = payload.get("hook_event_name") or payload.get("event") if payload else ""
+    tool = payload.get("tool_name") or payload.get("toolName") if payload else ""
     body = json.dumps(
         {
-            "source": "claude",
+            "source": getattr(args, "source", "claude"),
             "client_id": client_id(getattr(args, "client_id", None)),
-            "client_kind": "claude",
+            "client_kind": getattr(args, "client_kind", "claude"),
             "anim": anim,
             "event": event,
             "tool": tool,
@@ -243,10 +312,6 @@ def deliver_anim(anim: str, args: argparse.Namespace, payload: dict | None = Non
 # Transport helpers
 # ---------------------------------------------------------------------------
 
-def device_url() -> str:
-    return os.environ.get("CLAWD_TANK_URL", DEFAULT_URL).rstrip("/")
-
-
 def transport_name(cli_transport: str | None = None) -> str:
     return (cli_transport or os.environ.get("CLAWD_TANK_TRANSPORT") or "auto").lower()
 
@@ -260,11 +325,11 @@ def transport_list(selected: str) -> list[str]:
     }
     selected = aliases.get(selected, selected)
     if selected == "auto":
-        return ["ble", "serial", "http"]
+        return ["ble", "serial"]
     if selected == "parallel":
-        return ["ble", "serial", "http"]
+        return ["ble", "serial"]
     if "," in selected:
-        return [item.strip().lower() for item in selected.split(",") if item.strip()]
+        return [item.strip().lower() for item in selected.split(",") if item.strip() and item.strip().lower() != "http"]
     return [selected]
 
 
@@ -290,16 +355,68 @@ def port_matches_ch340(info: object) -> bool:
     return any(token in haystack for token in ("CH340", "CH341", "1A86", "USB-SERIAL"))
 
 
-def discover_ch340_port() -> str | None:
-    """Return the serial port field for the first detected CH340/CH341 adapter."""
+def port_score(info: object) -> int:
+    fields = (
+        "device",
+        "name",
+        "description",
+        "hwid",
+        "manufacturer",
+        "product",
+        "interface",
+        "location",
+    )
+    haystack = " ".join(str(getattr(info, field, "") or "") for field in fields).upper()
+    if any(token in haystack for token in ("BLUETOOTH", "STANDARD SERIAL OVER BLUETOOTH")):
+        return 0
+    vid = getattr(info, "vid", None)
+    if vid == CH340_VID or port_matches_ch340(info):
+        return 100
+    if vid == ESPRESSIF_USB_VID:
+        return 95
+    if any(token in haystack for token in ("ESPRESSIF", "ESP32", "USB JTAG", "USB-TO-UART", "USB SERIAL", "USB CDC", "CP210")):
+        return 90
+    return 0
+
+
+def discover_serial_port() -> str | None:
+    """Return the most likely ESP32 serial port, covering CH340 and native USB CDC."""
     try:
         from serial.tools import list_ports  # type: ignore
-        for info in list_ports.comports():
-            if port_matches_ch340(info):
-                return info.device
+        candidates = sorted(
+            ((port_score(info), info.device) for info in list_ports.comports()),
+            reverse=True,
+        )
+        for score, device in candidates:
+            if score > 0:
+                return device
     except Exception:
         pass
     return None
+
+
+def discover_ch340_port() -> str | None:
+    """Backward-compatible alias for serial auto-detection."""
+    return discover_serial_port()
+
+
+def describe_serial_port(port: str | None) -> str:
+    if not port:
+        return "none"
+    return port
+
+
+def wait_for_serial_ready(ser: object, timeout: float = 4.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line:
+            log(f"serial boot: {line}")
+        if "Clawd Mochi Tank ready" in line or "Serial command examples" in line:
+            return
 
 
 def list_windows_ports() -> list[str]:
@@ -324,10 +441,9 @@ def list_windows_ports() -> list[str]:
 def doctor() -> int:
     print("Clawd transport doctor")
     print(f"default transport: {transport_name()}")
-    print(f"http url: {device_url()}")
 
-    ch340 = discover_ch340_port()
-    print(f"CH340 auto-detect: {ch340 or 'none'}")
+    serial_port = discover_serial_port()
+    print(f"serial auto-detect: {describe_serial_port(serial_port)}")
 
     all_ports = list_windows_ports()
     if all_ports:
@@ -354,25 +470,12 @@ def doctor() -> int:
 # Send helpers
 # ---------------------------------------------------------------------------
 
-def send_anim_http(anim: str) -> bool:
-    base = device_url()
-    # Disable firmware auto-cycle before explicit Claude-driven status.
-    for path in ("/auto?on=0", f"/anim?id={urllib.parse.quote(anim)}"):
-        try:
-            with urllib.request.urlopen(base + path, timeout=0.8) as resp:
-                resp.read(256)
-        except Exception as exc:  # best effort only
-            log(f"send failed anim={anim} path={path}: {exc}")
-            return False
-    log(f"sent http anim={anim}")
-    return True
-
 
 def send_anim_serial(anim: str, port: str | None = None, baud: int | None = None) -> bool:
     serial_port = (
         port
         or os.environ.get("CLAWD_TANK_SERIAL_PORT")
-        or discover_ch340_port()
+        or discover_serial_port()
     )
     if not serial_port:
         log("serial transport selected but no COM port was found; set CLAWD_TANK_SERIAL_PORT/--port")
@@ -384,31 +487,42 @@ def send_anim_serial(anim: str, port: str | None = None, baud: int | None = None
         log("serial transport requires pyserial: python -m pip install pyserial")
         return False
 
-    try:
-        ser = serial.Serial()
-        ser.port = serial_port
-        ser.baudrate = baud or int(os.environ.get("CLAWD_TANK_SERIAL_BAUD", DEFAULT_BAUD))
-        ser.timeout = 0.4
-        ser.rtscts = False
-        ser.dsrdtr = False
-        ser.dtr = False
-        ser.rts = False
-        with ser:
-            ser.dtr = False
-            ser.rts = False
-            ser.write(command_payload(anim).encode("utf-8"))
-            ser.flush()
-            deadline = time.time() + 0.8
-            while time.time() < deadline:
-                line = ser.readline().decode("utf-8", errors="replace").strip()
-                if line.startswith("{") and "\"anim\"" in line:
-                    log(f"serial state port={serial_port}: {line}")
-                    break
-        log(f"sent serial port={serial_port} anim={anim}")
-        return True
-    except Exception as exc:
-        log(f"serial send failed port={serial_port} anim={anim}: {exc}")
-        return False
+    last_exc: Exception | None = None
+    with SERIAL_LOCK:
+        for attempt in range(3):
+            try:
+                ser = serial.Serial()
+                ser.port = serial_port
+                ser.baudrate = baud or int(os.environ.get("CLAWD_TANK_SERIAL_BAUD", DEFAULT_BAUD))
+                ser.timeout = 0.4
+                ser.rtscts = False
+                ser.dsrdtr = False
+                ser.dtr = False
+                ser.rts = False
+                got_ack = False
+                with ser:
+                    ser.dtr = False
+                    ser.rts = False
+                    ser.reset_input_buffer()
+                    wait_for_serial_ready(ser)
+                    ser.write(command_payload(anim).encode("utf-8"))
+                    ser.flush()
+                    deadline = time.time() + 1.5
+                    while time.time() < deadline:
+                        line = ser.readline().decode("utf-8", errors="replace").strip()
+                        if "{" in line and "\"anim\"" in line:
+                            log(f"serial state port={serial_port}: {line}")
+                            got_ack = True
+                            break
+                if got_ack:
+                    log(f"sent serial port={serial_port} anim={anim}")
+                    return True
+                last_exc = TimeoutError("serial command written but no firmware state ack received")
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.15 * (attempt + 1))
+    log(f"serial send failed port={serial_port} anim={anim}: {last_exc}")
+    return False
 
 
 async def _send_anim_ble_async(anim: str, address: str | None, name: str) -> bool:
@@ -459,14 +573,12 @@ def send_anim(anim: str, transport: str | None = None, port: str | None = None, 
 
     for item in transports:
         sent = False
-        if item == "http":
-            sent = send_anim_http(anim)
-        elif item == "serial":
+        if item == "serial":
             sent = send_anim_serial(anim, port=port, baud=baud)
         elif item == "ble":
             sent = send_anim_ble(anim, address=ble_address, name=ble_name)
         else:
-            log(f"unknown transport={item!r}; expected http, serial, ble, auto, parallel, or comma list")
+            log(f"unknown transport={item!r}; expected serial, ble, auto, parallel, or comma list")
             continue
 
         sent_any = sent_any or sent
@@ -478,11 +590,11 @@ def send_anim(anim: str, transport: str | None = None, port: str | None = None, 
 
 
 # ---------------------------------------------------------------------------
-# Timed idle → sleeping transition (spawned as detached process after Stop)
+# Timed completion → idle → sleeping transition (spawned after Stop)
 # ---------------------------------------------------------------------------
 
 def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
-    """Detach a background process: happy(10s) → idle(30s) → sleeping."""
+    """Detach a background process: complete -> idle -> sleeping."""
     cmd = [sys.executable, __file__, "--timed-transition", f"{event_time:.6f}"]
     if args.transport:
         cmd += ["--transport", args.transport]
@@ -513,7 +625,7 @@ def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
 
 def run_timed_transition(event_time: float, transport: str | None, port: str | None,
                          baud: int | None, ble_address: str | None, ble_name: str | None) -> None:
-    """Background: wait HAPPY_DURATION_S → idle, then IDLE_DURATION_S → sleeping."""
+    """Background: wait after completion, then idle, then sleeping."""
     args = argparse.Namespace(
         transport=transport,
         port=port,
@@ -526,88 +638,118 @@ def run_timed_transition(event_time: float, transport: str | None, port: str | N
         client_id=DEFAULT_CLIENT_ID,
     )
 
-    time.sleep(HAPPY_DURATION_S)
+    time.sleep(COMPLETE_DURATION_S)
     if read_last_event() > event_time + 1.0:
         log(f"timed transition aborted (new activity)")
         return
-    deliver_anim("idle", args, event_time=event_time)
-    log("timed transition: happy → idle")
+    deliver_anim(SESSION_IDLE_ANIM, args, event_time=event_time)
+    log(f"timed transition: {TASK_COMPLETE_ANIM} -> {SESSION_IDLE_ANIM}")
 
     time.sleep(IDLE_DURATION_S)
     if read_last_event() > event_time + 1.0:
         log(f"timed transition aborted (new activity during idle)")
         return
-    deliver_anim("sleeping", args, event_time=event_time)
-    log("timed transition: idle → sleeping")
+    deliver_anim(SLEEP_ANIM, args, event_time=event_time)
+    log(f"timed transition: {SESSION_IDLE_ANIM} -> {SLEEP_ANIM}")
 
 
 # ---------------------------------------------------------------------------
 # Animation mapping
 # ---------------------------------------------------------------------------
 
-def tool_to_anim(tool_name: str) -> str:
-    tool = tool_name or ""
-    if tool in EDIT_TOOLS:
-        return "typing"
-    if tool in DEBUG_TOOLS:
-        return "debugger"
-    if tool in BUILD_TOOLS:
-        return "building"
-    if tool in WEB_TOOLS:
-        return "wizard"
-    if tool in AGENT_TOOLS:
-        return "conducting"
-    if tool in MANAGE_TOOLS:
+def normalize_tool_name(tool_name: str) -> str:
+    """Collapse namespaced tool ids to their stable leaf names."""
+    tool = str(tool_name or "").strip()
+    if not tool:
+        return ""
+    return tool.rsplit(".", 1)[-1]
+
+
+def tool_to_anim(tool_name: str, tool_input: object | None = None) -> str:
+    tool = normalize_tool_name(tool_name)
+    raw_tool = str(tool_name or "")
+    candidates = {tool, raw_tool}
+
+    if tool == "parallel" and isinstance(tool_input, dict):
+        recipients = [
+            str(item.get("recipient_name", ""))
+            for item in tool_input.get("tool_uses", [])
+            if isinstance(item, dict)
+        ]
+        if recipients and all(tool_matches(name, EDIT_TOOLS) for name in recipients):
+            return "typing"
+        if recipients and all(tool_matches(name, BUILD_TOOLS) for name in recipients):
+            return "building"
+        if recipients and all(tool_matches(name, DEBUG_TOOLS) for name in recipients):
+            return "debugger"
         return "juggling"
-    if tool in ASK_TOOLS:
+
+    if candidates & EDIT_TOOLS:
+        return "typing"
+    if candidates & DEBUG_TOOLS:
+        return "debugger"
+    if candidates & BUILD_TOOLS:
+        return "building"
+    if candidates & WEB_TOOLS:
+        return "wizard"
+    if candidates & AGENT_TOOLS:
+        return "conducting"
+    if candidates & MANAGE_TOOLS:
+        return "juggling"
+    if candidates & ASK_TOOLS:
         return "confused"
 
-    lower = tool.lower()
+    lower = raw_tool.lower()
     if any(hint in lower for hint in BEACON_HINTS):
         return "beacon"
     return "typing"
 
 
+def tool_matches(tool_name: str, names: set[str]) -> bool:
+    return bool({normalize_tool_name(tool_name), str(tool_name or "")} & names)
+
+
 def payload_to_anim(payload: dict) -> str | None:
     event = payload.get("hook_event_name") or payload.get("event") or ""
     tool = payload.get("tool_name") or payload.get("toolName") or ""
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
 
     if event == "SessionStart":
-        return "idle"
+        return SESSION_IDLE_ANIM
     if event == "PreToolUse":
-        # bypassPermissions = all tools auto-approved, show what's happening
-        # any other mode = tool may need user approval before running → confused
-        if payload.get("permission_mode") == "bypassPermissions":
-            return tool_to_anim(str(tool))
+        return tool_to_anim(str(tool), tool_input)
+    if event == "PermissionRequest":
         return "confused"
     if event == "PostToolUse":
-        # Show the animation for the tool that just ran so the user sees
-        # confirmation after approving (confused → building/typing/etc.)
-        return tool_to_anim(str(tool))
+        # Once the tool has completed, Claude is back to reading the result and
+        # deciding the next step. Keep the display on the model state instead
+        # of leaving it stuck on the previous tool animation.
+        return "thinking"
     if event == "PreCompact":
         return "sweeping"
+    if event == "PostCompact":
+        return "thinking"
     if event == "Stop":
-        return "happy"
+        return TASK_COMPLETE_ANIM
     if event == "StopFailure":
         return "dizzy"
     if event == "Notification":
         return "confused"
     if event == "UserPromptSubmit":
         return "thinking"
-    if event == "SessionEnd":
-        return "going_away"
     if event == "SubagentStart":
         return "conducting"
     if event == "SubagentStop":
         return "thinking"
+    if event == "SessionEnd":
+        return "going_away"
 
     return None
 
 
 def read_payload() -> dict | None:
-    # Read stdin as UTF-8 explicitly. On non-UTF-8 locales (e.g. Windows GBK)
-    # sys.stdin.read() mis-decodes multibyte payloads and breaks JSON parsing,
-    # silently dropping hook events (notably Stop -> happy).
+    # Claude Code writes UTF-8 hook JSON even on Windows systems whose default
+    # console encoding is not UTF-8.
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     except Exception:
@@ -629,8 +771,8 @@ def main() -> int:
     parser.add_argument("--test", help="send a specific animation and exit")
     parser.add_argument("--doctor", action="store_true", help="show discovered transports and dependencies")
     parser.add_argument("--print-mapping", action="store_true")
-    parser.add_argument("--transport", help="http, serial, ble, auto, parallel/all, or comma list")
-    parser.add_argument("--port", help="optional serial port override; CH340 is auto-detected when omitted")
+    parser.add_argument("--transport", help="serial, ble, auto, parallel/all, or comma list")
+    parser.add_argument("--port", help="optional serial port override; ESP32 serial is auto-detected when omitted")
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--ble-address")
     parser.add_argument("--ble-name", default=None)
@@ -639,7 +781,7 @@ def main() -> int:
     parser.add_argument("--hub-required", action="store_true", help="do not fall back to direct transports if hub fails")
     parser.add_argument("--client-id", default=os.environ.get("CLAWD_TANK_CLIENT_ID", DEFAULT_CLIENT_ID))
     parser.add_argument("--timed-transition", type=float, default=None, metavar="EPOCH",
-                        help="internal: run happy→idle→sleeping timer started at EPOCH")
+                        help="internal: run complete->idle->sleeping timer started at EPOCH")
     args = parser.parse_args()
 
     if args.doctor:
@@ -672,9 +814,12 @@ def main() -> int:
 
     anim = payload_to_anim(payload)
     if anim:
+        event = payload.get("hook_event_name") or payload.get("event") or ""
+        tool = payload.get("tool_name") or payload.get("toolName") or ""
+        log(f"mapped event={event!r} tool={tool!r} anim={anim}")
         deliver_anim(anim, args, payload=payload, event_time=event_time)
-        # After Stop → happy, spawn background timer for idle then sleeping
-        if anim == "happy":
+        # After Stop -> completion animation, spawn timer for idle then sleeping.
+        if event == "Stop":
             spawn_timed_transition(event_time, args)
     else:
         ntype = payload.get("notification_type") or payload.get("type") or ""

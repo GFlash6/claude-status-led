@@ -28,6 +28,7 @@ APP_NAME = "Clawd Hub"
 DEFAULT_HUB_URL = "http://127.0.0.1:8765"
 LOG_DIR = Path.home() / ".clawd-mochi"
 APP_PID_PATH = LOG_DIR / "hub-app.pid"
+HUB_START_LOCK_PATH = LOG_DIR / "status-hub.start.lock"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HUB_SCRIPT = SCRIPT_DIR / "clawd_status_hub.py"
 WATCHER_SCRIPT = SCRIPT_DIR / "codex_session_watch.py"
@@ -51,6 +52,32 @@ def write_pid() -> None:
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         APP_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def acquire_start_lock(path: Path, stale_seconds: float = 10.0) -> bool:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time():.6f}\n")
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - path.stat().st_mtime > stale_seconds:
+                path.unlink(missing_ok=True)
+                return acquire_start_lock(path, stale_seconds)
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+
+
+def release_start_lock(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -83,10 +110,32 @@ class HubController:
             return
         except Exception:
             pass
-        subprocess.Popen(
-            [sys.executable, str(HUB_SCRIPT), "--transport", self.transport],
-            **process_kwargs(),
-        )
+        if not acquire_start_lock(HUB_START_LOCK_PATH):
+            time.sleep(0.5)
+            try:
+                self.health()
+            except Exception:
+                pass
+            return
+        try:
+            try:
+                self.health()
+                return
+            except Exception:
+                pass
+            subprocess.Popen(
+                [sys.executable, str(HUB_SCRIPT), "--transport", self.transport],
+                **process_kwargs(),
+            )
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    self.health()
+                    return
+                except Exception:
+                    time.sleep(0.15)
+        finally:
+            release_start_lock(HUB_START_LOCK_PATH)
 
     def restart_hub(self) -> dict[str, Any]:
         try:

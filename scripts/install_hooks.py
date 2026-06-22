@@ -17,8 +17,10 @@ STARTUP_SHORTCUT_NAME = "Clawd Hub App.lnk"
 HOOK_EVENTS = [
     "SessionStart",
     "PreToolUse",
+    "PermissionRequest",
     "PostToolUse",
     "PreCompact",
+    "PostCompact",
     "Stop",
     "StopFailure",
     "Notification",
@@ -86,7 +88,16 @@ def launch_hub_app(app_script: Path) -> None:
 
 
 def hook_entry(command: str, event: str) -> dict:
-    return {"hooks": [{"type": "command", "command": command}]}
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": 5,
+                "statusMessage": "Updating Clawd display",
+            }
+        ]
+    }
 
 
 def remove_old_clawd_hooks(entries: list[dict]) -> list[dict]:
