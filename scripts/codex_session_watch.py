@@ -74,6 +74,15 @@ def parse_tool_input(raw: Any) -> object | None:
     return None
 
 
+def wants_escalated_permission(tool_name: str, tool_input: object | None) -> bool:
+    if tool_name not in {"shell_command", "functions.shell_command"}:
+        return False
+    if not isinstance(tool_input, dict):
+        return False
+    value = str(tool_input.get("sandbox_permissions") or "")
+    return value == "require_escalated"
+
+
 def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
     item_type = item.get("type")
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
@@ -95,6 +104,8 @@ def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
     if payload_type in {"function_call", "custom_tool_call"}:
         name = str(payload.get("name") or "")
         tool_input = parse_tool_input(payload.get("arguments") or payload.get("input"))
+        if wants_escalated_permission(name, tool_input):
+            return "confused", f"session permission_request tool={name!r}"
         anim = hook.tool_to_anim(name, tool_input)
         return anim, f"session {payload_type} tool={name!r}"
 

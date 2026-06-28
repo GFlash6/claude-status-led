@@ -32,6 +32,48 @@ RUN_LOCK_PATH = LOG_DIR / "status-hub.run.lock"
 EVENTS_LIMIT = 300
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+EFFECTS_PATH = LOG_DIR / "status-effects.json"
+
+STATUS_LABELS = {
+    "idle": "空闲",
+    "working": "工作中",
+    "waiting": "等待确认",
+    "complete": "完成",
+    "error": "错误",
+    "waiting_connection": "等待连接",
+    "sleeping": "休眠",
+}
+
+DEFAULT_STATUS_EFFECTS: dict[str, dict[str, Any]] = {
+    "idle": {"leds": "001"},
+    "working": {"effect": {"pattern": "chase", "mask": "111", "period": 220}},
+    "waiting": {"effect": {"pattern": "blink", "mask": "010", "period": 420}},
+    "complete": {"leds": "001"},
+    "error": {"effect": {"pattern": "blink", "mask": "100", "period": 220}},
+    "waiting_connection": {"effect": {"pattern": "chase", "mask": "010", "period": 180}},
+    "sleeping": {"leds": "000"},
+}
+
+ANIM_STATUS_MAP = {
+    "idle": "idle",
+    "typing": "working",
+    "thinking": "working",
+    "building": "working",
+    "debugger": "working",
+    "wizard": "working",
+    "conducting": "working",
+    "juggling": "working",
+    "sweeping": "working",
+    "walking": "working",
+    "confused": "waiting",
+    "alert": "waiting",
+    "happy": "complete",
+    "dizzy": "error",
+    "beacon": "waiting_connection",
+    "disconnected": "waiting_connection",
+    "sleeping": "sleeping",
+    "going_away": "sleeping",
+}
 
 
 def import_bridge():
@@ -128,6 +170,32 @@ def file_contains(path: Path, needle: str) -> bool:
         return False
 
 
+def normalized_status_effects(data: object | None = None) -> dict[str, dict[str, Any]]:
+    result = json.loads(json.dumps(DEFAULT_STATUS_EFFECTS, ensure_ascii=False))
+    if isinstance(data, dict):
+        for key in STATUS_LABELS:
+            value = data.get(key)
+            if isinstance(value, dict):
+                result[key] = value
+    return result
+
+
+def read_status_effects() -> dict[str, dict[str, Any]]:
+    try:
+        return normalized_status_effects(json.loads(EFFECTS_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return normalized_status_effects()
+
+
+def write_status_effects(effects: dict[str, dict[str, Any]]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    EFFECTS_PATH.write_text(json.dumps(effects, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def status_for_anim(anim: str) -> str:
+    return ANIM_STATUS_MAP.get(str(anim or "").strip(), "working")
+
+
 def fmt_age(ts: float | None) -> str:
     if not ts:
         return ""
@@ -171,8 +239,8 @@ class BleSession:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def send(self, anim: str, timeout: float = 8.0) -> tuple[bool, str]:
-        fut = asyncio.run_coroutine_threadsafe(self._send(anim), self.loop)
+    def send(self, command: str | dict, timeout: float = 8.0) -> tuple[bool, str]:
+        fut = asyncio.run_coroutine_threadsafe(self._send(command), self.loop)
         try:
             return fut.result(timeout=timeout)
         except Exception as exc:
@@ -243,7 +311,7 @@ class BleSession:
         rows.sort(key=lambda item: (not item["suggested"], item["name"] or "", item["address"]))
         return rows
 
-    async def _send(self, anim: str) -> tuple[bool, str]:
+    async def _send(self, command: str | dict) -> tuple[bool, str]:
         try:
             from bleak import BleakClient, BleakScanner  # type: ignore
         except ImportError:
@@ -255,7 +323,7 @@ class BleSession:
                 return False, message
             await self.client.write_gatt_char(
                 bridge.BLE_RX_UUID,
-                bridge.command_payload(anim).encode("utf-8"),
+                bridge.command_payload(command).encode("utf-8"),
                 response=False,
             )
             return True, f"BLE {self.target}"
@@ -366,21 +434,21 @@ class SerialSession:
             self._close_locked()
             return True, "serial disconnected"
 
-    def send(self, anim: str) -> tuple[bool, str]:
+    def send(self, command: str | dict) -> tuple[bool, str]:
         with self.lock:
             if self.ser is None or not getattr(self.ser, "is_open", False):
                 ok, message = self.connect(self.port, self.baud)
                 if not ok:
                     return False, message
             try:
-                self.ser.write(bridge.command_payload(anim).encode("utf-8"))
+                self.ser.write(bridge.command_payload(command).encode("utf-8"))
                 self.ser.flush()
-                deadline = time.time() + 1.5
+                deadline = time.time() + 0.15
                 while time.time() < deadline:
                     line = self.ser.readline().decode("utf-8", errors="replace").strip()
                     if "{" in line and "\"anim\"" in line:
                         return True, f"serial delivered {self.port}"
-                return False, "serial command written but no firmware state ack received"
+                return True, f"serial delivered {self.port} (no ack)"
             except Exception as exc:
                 self._close_locked()
                 return False, f"serial failed {self.port}: {exc}"
@@ -403,6 +471,8 @@ class HubState:
         self.hooks: dict[str, dict[str, Any]] = {}
         self.clients: dict[str, dict[str, Any]] = {}
         self.transports: dict[str, dict[str, Any]] = {}
+        self.status_effects = read_status_effects()
+        self.use_status_effects = os.environ.get("CLAWD_TANK_USE_STATUS_EFFECTS", "0").lower() in {"1", "true", "yes", "on"}
         self.state: dict[str, Any] = {
             "started_at": now_iso(),
             "current_anim": None,
@@ -411,6 +481,7 @@ class HubState:
             "current_client_kind": None,
             "current_event": None,
             "current_tool": None,
+            "current_status": None,
             "transport": None,
             "transport_status": "idle",
             "transport_message": "",
@@ -462,7 +533,24 @@ class HubState:
             "ble_name": ble_status["name"],
             "ble_address": ble_status["address"],
             "ble_connected": ble_status["connected"],
+            "use_status_effects": self.use_status_effects,
         }
+
+    def status_effect_config(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "labels": STATUS_LABELS,
+                "effects": self.status_effects,
+                "defaults": DEFAULT_STATUS_EFFECTS,
+            }
+
+    def update_status_effects(self, data: dict[str, Any]) -> dict[str, Any]:
+        incoming = data.get("effects") if isinstance(data.get("effects"), dict) else data
+        effects = normalized_status_effects(incoming)
+        write_status_effects(effects)
+        with self.lock:
+            self.status_effects = effects
+        return self.status_effect_config()
 
     def update_config(self, data: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -484,6 +572,8 @@ class HubState:
                     "message": address or "auto BLE discovery",
                     "last_at": time.time(),
                 }
+            if "use_status_effects" in data:
+                self.use_status_effects = bool(data.get("use_status_effects"))
             if "transport" in data:
                 transport = str(data.get("transport") or "").strip().lower()
                 if transport:
@@ -628,6 +718,8 @@ class HubState:
         with self.lock:
             return {
                 **self.state,
+                "status_labels": STATUS_LABELS,
+                "status_effects": self.status_effects,
                 "hooks": self.hooks,
                 "clients": self.clients,
                 "transports": self.transports,
@@ -637,8 +729,8 @@ class HubState:
             }
 
     def modules_locked(self) -> dict[str, dict[str, Any]]:
-        claude_settings = Path.home() / ".claude" / "settings.json"
         codex_hooks = Path.home() / ".codex" / "hooks.json"
+        claude_settings = Path.home() / ".claude" / "settings.json"
         watcher_pid = read_pid(WATCH_PID_PATH)
         serial_port = ""
         try:
@@ -705,7 +797,7 @@ class HubState:
             },
             "claude-hook": client_module(
                 "claude-code",
-                "Claude Code native hook",
+                "Claude Code hook",
                 file_contains(claude_settings, "claude_clawd_hook.py"),
             ),
             "esp32": {
@@ -729,16 +821,34 @@ class HubState:
                 del self.events[: len(self.events) - EVENTS_LIMIT]
 
     def deliver(self, delivery: dict[str, Any]) -> dict[str, Any]:
-        anim = str(delivery.get("anim") or "").strip()
-        if not anim:
-            return {"ok": False, "error": "missing anim"}
-
         payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
         source = str(delivery.get("source") or "manual")
         client_id = str(delivery.get("client_id") or source or "manual")
         client_kind = str(delivery.get("client_kind") or source or "manual")
         event = str(delivery.get("event") or payload.get("hook_event_name") or payload.get("event") or "")
         tool = str(delivery.get("tool") or payload.get("tool_name") or payload.get("toolName") or "")
+
+        original_command = self.device_command(delivery)
+        original_anim = str(original_command.get("anim") or delivery.get("anim") or "").strip()
+        semantic_status = str(delivery.get("status") or status_for_anim(original_anim))
+        command = original_command
+        if (
+            source != "manual"
+            and self.use_status_effects
+            and semantic_status in self.status_effects
+        ):
+            command = self.device_command(self.status_effects[semantic_status])
+            command.setdefault("status", semantic_status)
+
+        anim = str(command.get("anim") or delivery.get("anim") or "").strip()
+        if not anim:
+            if "effect" in command or "steps" in command or "pattern" in command:
+                anim = "custom"
+            elif any(key in command for key in ("leds", "led", "mask")):
+                anim = "manual"
+        if not anim:
+            return {"ok": False, "error": "missing anim or effect"}
+
         ts = time.time()
         hook_key = f"{client_id}:{event}" if event else client_id
 
@@ -765,6 +875,7 @@ class HubState:
                     "current_client_kind": client_kind,
                     "current_event": event,
                     "current_tool": tool,
+                    "current_status": semantic_status,
                     "transport_status": "sending",
                     "last_hook_at": ts,
                     "last_error": None,
@@ -787,7 +898,7 @@ class HubState:
         results = []
         sent = False
         for transport in bridge.transport_list(self.args.transport):
-            ok, message = self.send_by_transport(anim, transport)
+            ok, message = self.send_by_transport(command, transport)
             results.append({"transport": transport, "ok": ok, "message": message})
             if ok:
                 sent = True
@@ -804,6 +915,8 @@ class HubState:
             "event": event,
             "tool": tool,
             "anim": anim,
+            "semantic_status": semantic_status,
+            "original_anim": original_anim,
             "status": status,
             "elapsed_ms": elapsed_ms,
             "results": results,
@@ -843,11 +956,20 @@ class HubState:
         log(f"{status} client={client_id} source={source} event={event!r} tool={tool!r} anim={anim} results={results}")
         return {"ok": sent, "status": status, "elapsed_ms": elapsed_ms, "results": results}
 
-    def send_by_transport(self, anim: str, transport: str) -> tuple[bool, str]:
+    def device_command(self, delivery: dict[str, Any]) -> dict[str, Any]:
+        command: dict[str, Any] = {"auto": False}
+        for key in ("anim", "id", "leds", "led", "mask", "speed", "backlight", "effect", "steps", "pattern", "period", "period_ms"):
+            if key in delivery:
+                command[key] = delivery[key]
+        if "effect" in command and isinstance(command["effect"], dict):
+            command.setdefault("anim", "custom")
+        return command
+
+    def send_by_transport(self, command: str | dict, transport: str) -> tuple[bool, str]:
         if transport == "ble":
-            return self.ble.send(anim)
+            return self.ble.send(command)
         if transport == "serial":
-            ok, message = self.serial.send(anim)
+            ok, message = self.serial.send(command)
             self.args.port = self.serial.port
             return ok, message
         return False, f"unknown transport {transport!r}"
@@ -855,19 +977,19 @@ class HubState:
 
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Clawd Hook Hub</title>
+<title>红绿灯控制台</title>
 <style>
 :root{--bg:#0d0f13;--panel:#15181f;--raised:#1b1f28;--line:#272d38;--text:#eef1f5;--muted:#8c95a3;--accent:#d97757;--accent2:#e8927c;--ok:#5fd39a;--bad:#ff7c6c;--warn:#f3c552}
 *{box-sizing:border-box}
 body{margin:0;background:radial-gradient(1200px 600px at 72% -12%,#1a1d26 0%,var(--bg) 55%);color:var(--text);font-family:"Segoe UI",system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
-main{max-width:1400px;margin:0 auto;padding:0 24px 44px}
+main{max-width:980px;margin:0 auto;padding:0 24px 44px}
 .top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:13px;padding:16px 0;margin-bottom:6px;background:linear-gradient(180deg,var(--bg) 72%,transparent)}
 .logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#b85a3e);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;box-shadow:0 4px 14px rgba(217,119,87,.4)}
 .title{display:flex;flex-direction:column;line-height:1.15}
 .title b{font-size:19px;letter-spacing:.2px}
 .title span{font-size:12px;color:var(--muted)}
 .spacer{flex:1}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:20px}
+.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(320px,.75fr);gap:20px}
 .panel{border:1px solid var(--line);border-radius:16px;padding:20px;background:linear-gradient(180deg,var(--panel),#12151b);box-shadow:0 1px 0 rgba(255,255,255,.02) inset,0 10px 26px rgba(0,0,0,.28);transition:transform 0.2s,box-shadow 0.2s}
 .panel:hover{transform:translateY(-2px);box-shadow:0 12px 32px rgba(0,0,0,.4)}
 .panel.wide{grid-column:1/-1}
@@ -891,6 +1013,36 @@ main{max-width:1400px;margin:0 auto;padding:0 24px 44px}
 .chip.active{background:linear-gradient(135deg,var(--accent),#b85a3e);border-color:transparent;color:#fff;box-shadow:0 4px 12px rgba(217,119,87,.32)}
 .btn{font-size:12px;font-weight:600;background:var(--raised);color:#cfd5de;border:1px solid var(--line);border-radius:8px;padding:6px 11px;margin:2px 2px 2px 0;cursor:pointer;transition:.15s}
 .btn:hover{border-color:var(--accent);color:#fff}
+.btn.ok{border-color:rgba(95,211,154,.5);color:var(--ok)}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px}
+.control-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.field{width:100%;background:#10131a;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:12px "Cascadia Code",Consolas,ui-monospace,monospace;outline:none}
+.field:focus{border-color:var(--accent)}
+.signal-wrap{display:grid;grid-template-columns:112px 1fr;gap:18px;align-items:center;margin-bottom:16px}
+.signal{width:112px;padding:12px;border-radius:18px;background:#080a0d;border:1px solid #252b35;box-shadow:inset 0 0 18px rgba(0,0,0,.75),0 12px 26px rgba(0,0,0,.28)}
+.lamp{width:72px;height:72px;margin:9px auto;border-radius:50%;background:#222831;border:1px solid #333b48;box-shadow:inset 0 3px 12px rgba(0,0,0,.75);transition:.12s}
+.lamp.red.on{background:#ff4a3d;box-shadow:0 0 24px rgba(255,74,61,.72),inset 0 2px 10px rgba(255,255,255,.25)}
+.lamp.yellow.on{background:#ffd24c;box-shadow:0 0 24px rgba(255,210,76,.65),inset 0 2px 10px rgba(255,255,255,.3)}
+.lamp.green.on{background:#40d979;box-shadow:0 0 24px rgba(64,217,121,.65),inset 0 2px 10px rgba(255,255,255,.28)}
+.signal-status{min-width:0}
+.signal-status b{display:block;font-size:20px;margin-bottom:8px}
+.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
+.status-card{border:1px solid var(--line);border-radius:8px;padding:10px;background:#10131a;min-width:0}
+.status-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.status-card-title{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap}
+.status-card-actions{display:flex;align-items:center;gap:6px;min-width:0}
+.btn.mini{padding:4px 7px;font-size:11px;line-height:1}
+.status-card-detail{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.map-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.map-item{border:1px solid var(--line);border-radius:8px;padding:10px;background:#10131a}
+.map-title{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+.select{width:100%;background:var(--raised);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;outline:none}
+.select:focus{border-color:var(--accent)}
+.custom-panel{grid-column:1/-1}
+.custom-panel details{border:1px solid var(--line);border-radius:8px;background:#10131a;padding:10px}
+.custom-panel summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}
+.custom-panel summary::marker{color:var(--accent)}
+.custom-panel #statusMapper{margin-top:10px}
 .sub{font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin:15px 0 7px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -901,121 +1053,255 @@ tbody tr:hover td,table tr:hover td{background:rgba(217,119,87,.05)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.send{color:var(--warn)}.muted,.k{color:var(--muted)}
 .empty{color:var(--muted);font-size:13px;padding:10px 2px;text-align:center}
 p{margin:7px 0}
+@media(max-width:760px){main{padding:0 14px 28px}.grid,.status-strip{grid-template-columns:1fr}.controls{grid-template-columns:1fr}.hero-anim{font-size:28px}.signal-wrap{grid-template-columns:1fr}.signal{margin:auto}}
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#2a313c;border-radius:6px}
 </style></head><body><main>
 <header class="top">
-<div class="logo">C</div>
-<div class="title"><b>Clawd Hook Hub</b><span>local animation router</span></div>
+<div class="logo">灯</div>
+<div class="title"><b>红绿灯控制台</b><span>三色灯控制器</span></div>
 <div class="spacer"></div>
-<span id="status" class="pill muted">loading</span>
+<span id="status" class="pill muted">加载中</span>
 </header>
+<div id="statusBar" class="status-strip"></div>
 <div class="grid">
-<section class="panel"><div class="ph">Current</div><div id="current"></div><div class="sub">Manual trigger</div><div id="buttons" class="chips"></div></section>
-<section class="panel"><div class="ph">Transports</div><div id="transport"></div><div class="sub">Select device</div><div id="selectors"></div></section>
-<section class="panel"><div class="ph">Modules</div><table id="modules"></table></section>
-<section class="panel"><div class="ph">Clients</div><table id="clients"></table></section>
-<section class="panel"><div class="ph">Hooks</div><table id="hooks"></table></section>
-<section class="panel wide"><div class="ph">Events</div><table id="events"></table></section>
+<section class="panel"><div class="ph">红绿灯</div><div id="signalPreview"></div><div id="current"></div><div class="sub">快捷控制</div><div id="buttons" class="chips"></div><div id="effectControls" class="controls"></div></section>
+<section class="panel"><div class="ph">设备</div><div id="transport"></div><div class="sub">连接</div><div id="selectors"></div></section>
+<section class="panel custom-panel"><div class="ph">自定义</div><details open><summary>Hook 状态灯效映射</summary><div id="statusMapper"></div></details></section>
 </div>
 <script>
-const anims=["idle","thinking","typing","building","debugger","wizard","conducting","juggling","confused","sweeping","happy","sleeping","beacon","alert","dizzy"];
-buttons.innerHTML=anims.map(a=>`<button class="chip" data-a="${a}" onclick="send('${a}')">${a}</button>`).join("");
+const statusOrder=[
+  ["idle","空闲"],["working","工作中"],["waiting","等待确认"],["complete","完成"],["error","错误"],["waiting_connection","等待连接"],["sleeping","休眠"]
+];
+const effectOptions=[
+  {id:"red",label:"红灯常亮",command:{leds:"100"}},
+  {id:"yellow",label:"黄灯常亮",command:{leds:"010"}},
+  {id:"green",label:"绿灯常亮",command:{leds:"001"}},
+  {id:"off",label:"全灭",command:{leds:"000"}},
+  {id:"all",label:"全亮",command:{leds:"111"}},
+  {id:"red_blink",label:"红灯闪烁",command:{effect:{pattern:"blink",mask:"100",period:220}}},
+  {id:"yellow_blink",label:"黄灯闪烁",command:{effect:{pattern:"blink",mask:"010",period:420}}},
+  {id:"green_blink",label:"绿灯闪烁",command:{effect:{pattern:"blink",mask:"001",period:300}}},
+  {id:"all_chase",label:"全灯轮巡",command:{effect:{pattern:"chase",mask:"111",period:220}}},
+  {id:"yellow_chase",label:"黄灯等待轮巡",command:{effect:{pattern:"chase",mask:"010",period:180}}},
+  {id:"pair_chase",label:"双灯轮巡",command:{effect:{pattern:"pair_chase",mask:"111",period:260}}}
+];
+const presets=[
+  ["红灯","100"],["黄灯","010"],["绿灯","001"],["全灭","000"],["全亮","111"]
+];
+buttons.innerHTML=presets.map(([name,mask])=>`<button class="chip" data-mask="${mask}" onclick="sendPreset('${mask}')">${name}</button>`).join("")+
+  `<button class="chip" onclick="sendPattern('blink')">闪烁</button><button class="chip" onclick="sendPattern('chase')">轮巡</button>`;
 async function send(anim){await fetch('/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({anim})}); refresh();}
+async function sendPreset(mask){ledMask=mask; previewMode={type:"manual"}; renderEffectControls(); renderSignal(); await post('/send',{leds:mask}); refresh();}
+let ledMask="111";
+let customPeriod=250;
+let customSpeed=2;
+let backlightOn=true;
+let previewMode={type:"manual"};
+let previewStartedAt=Date.now();
+let statusEffects={};
+function clone(v){return JSON.parse(JSON.stringify(v))}
+function normalizeCommand(c){const copy=clone(c||{}); delete copy.auto; delete copy.anim; delete copy.status; return JSON.stringify(copy)}
+function effectIdForCommand(command){
+  const target=normalizeCommand(command);
+  const found=effectOptions.find(o=>normalizeCommand(o.command)===target);
+  return found?found.id:"all_chase";
+}
+function commandForEffect(id){
+  const found=effectOptions.find(o=>o.id===id)||effectOptions[0];
+  return clone(found.command);
+}
+function applyPreviewFromCommand(command){
+  const cmd=command||{};
+  if(cmd.leds||cmd.led||cmd.mask){ledMask=String(cmd.leds||cmd.led||cmd.mask).padStart(3,"0").slice(0,3); previewMode={type:"manual"};}
+  if(cmd.effect&&cmd.effect.pattern){ledMask=String(cmd.effect.mask||"111").padStart(3,"0").slice(0,3); customPeriod=Math.max(20,parseInt(cmd.effect.period||cmd.effect.period_ms||customPeriod)||customPeriod); previewMode={type:"pattern",pattern:cmd.effect.pattern}; previewStartedAt=Date.now();}
+  if(cmd.effect&&Array.isArray(cmd.effect.steps)){previewMode={type:"steps",steps:cmd.effect.steps}; previewStartedAt=Date.now();}
+  renderEffectControls(); renderSignal();
+}
+async function loadStatusEffects(){
+  const data=await (await fetch('/status-effects')).json();
+  statusEffects=data.effects||{};
+  renderStatusMapper();
+}
+function renderStatusMapper(){
+  const target=document.getElementById("statusMapper");
+  if(!target)return;
+  target.innerHTML=`<div class="control-row" style="margin-bottom:10px"><button class="btn ok" onclick="applyStatusEffects()">应用自定义灯效</button><span class="muted">按下后，自动状态会使用下面的映射</span></div><div class="map-grid">`+statusOrder.map(([key,label])=>{
+    const selected=effectIdForCommand(statusEffects[key]);
+    return `<div class="map-item"><div class="map-title"><b>${label}</b><button class="btn" onclick="testStatusEffect('${key}')">测试</button></div><select class="select" onchange="setStatusEffect('${key}',this.value)">`+
+      effectOptions.map(o=>`<option value="${o.id}" ${o.id===selected?"selected":""}>${o.label}</option>`).join("")+
+      `</select></div>`;
+  }).join("")+`</div>`;
+}
+async function applyStatusEffects(){
+  const result=await post('/config',{use_status_effects:true});
+  if(!result.use_status_effects){alert('应用失败');return}
+  await refresh();
+}
+async function setStatusEffect(statusKey,effectId){
+  statusEffects[statusKey]=commandForEffect(effectId);
+  await post('/status-effects',{effects:statusEffects});
+  renderStatusMapper();
+}
+async function testStatusEffect(statusKey){
+  const command=statusEffects[statusKey]||commandForEffect(effectIdForCommand(statusEffects[statusKey]));
+  applyPreviewFromCommand(command);
+  await post('/send',command);
+  refresh();
+}
+function renderEffectControls(){
+  effectControls.innerHTML=
+    `<div><div class="sub">灯位</div><div class="control-row">`+
+    ["红","黄","绿"].map((name,i)=>`<button class="btn ${ledMask[i]==="1"?"ok":""}" onclick="toggleLed(${i})">${name}</button>`).join("")+
+    `<button class="btn" onclick="sendMask()">应用</button></div></div>`+
+    `<div><div class="sub">输出</div><div class="control-row">`+
+    [1,2,3].map(v=>`<button class="btn ${customSpeed===v?"ok":""}" onclick="setSpeed(${v})">速度 ${v}</button>`).join("")+
+    `<button class="btn ${backlightOn?"ok":""}" onclick="toggleBacklight()">电源</button></div></div>`+
+    `<div><div class="sub">灯效</div><div class="control-row">`+
+    [["steady","常亮"],["blink","闪烁"],["chase","轮巡"],["alternate","交替"],["pair_chase","双灯轮巡"]].map(([p,label])=>`<button class="btn" onclick="sendPattern('${p}')">${label}</button>`).join("")+
+    `</div></div>`+
+    `<div><div class="sub">周期 ms</div><input id="periodField" class="field" value="${customPeriod}" onchange="customPeriod=Math.max(20,Math.min(10000,parseInt(this.value||250)||250)); renderSignal();"></div>`+
+    `<div style="grid-column:1/-1"><div class="sub">自定义步骤 JSON</div><input id="stepsField" class="field" value='[{"mask":"100","ms":120},{"mask":"010","ms":120},{"mask":"001","ms":120},{"mask":"000","ms":80}]'><button class="btn" onclick="sendSteps()">发送步骤</button></div>`;
+}
+function toggleLed(i){ledMask=ledMask.split("").map((v,n)=>n===i?(v==="1"?"0":"1"):v).join(""); renderEffectControls(); renderSignal();}
+async function sendMask(){previewMode={type:"manual"}; renderSignal(); await post('/send',{leds:ledMask}); refresh();}
+async function setSpeed(v){customSpeed=v; await post('/send',{speed:v,anim:"custom"}); renderEffectControls(); renderSignal(); refresh();}
+async function toggleBacklight(){backlightOn=!backlightOn; await post('/send',{backlight:backlightOn,anim:"custom"}); renderEffectControls(); renderSignal(); refresh();}
+async function sendPattern(pattern){previewMode={type:"pattern",pattern}; previewStartedAt=Date.now(); renderSignal(); await post('/send',{effect:{pattern,mask:ledMask,period:customPeriod}}); refresh();}
+async function sendSteps(){
+  try{const steps=JSON.parse(stepsField.value); previewMode={type:"steps",steps}; previewStartedAt=Date.now(); renderSignal(); await post('/send',{effect:{steps}}); refresh();}
+  catch(e){alert("步骤 JSON 格式不正确");}
+}
 async function post(url,body){return await (await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body||{})})).json();}
-function cls(s){return ["delivered","online","available","configured","selected","connected"].includes(s)?"ok":["failed","offline","missing"].includes(s)?"bad":s==="sending"?"send":"muted"}
-function pill(s){return `<span class="pill ${cls(s)}">${s||"idle"}</span>`}
+function cls(s){return ["delivered","online","available","configured","selected","connected","已连接","已选择","可用","在线"].includes(s)?"ok":["failed","offline","missing","失败","离线","缺失"].includes(s)?"bad":["sending","发送中"].includes(s)?"send":"muted"}
+function statusText(s){return {"delivered":"已送达","sending":"发送中","failed":"失败","idle":"空闲","online":"在线","offline":"离线","connected":"已连接","selected":"已选择","available":"可用","configured":"已配置","missing":"缺失"}[s]||s||"空闲"}
+function pill(s){return `<span class="pill ${cls(s)}">${statusText(s)}</span>`}
 function meta(l,v){const t=(v===0?"0":v||"").toString().replace(/"/g,"");return `<div class="meta"><span class="ml">${l}</span><span class="mv" title="${t}">${(v===0?"0":v)||""}</span></div>`}
 function none(t){return `<tr><td class="empty" colspan="9">${t}</td></tr>`}
 function q(s){return JSON.stringify(s||"")}
 function selected(a,b){return (a||"")===(b||"")}
-function modeLabel(mode){return mode==="ble"?"BLE only":mode==="serial"?"Serial only":"Auto: BLE -> Serial"}
+function modeLabel(mode){return mode==="ble"?"仅 BLE":mode==="serial"?"仅串口":"自动：BLE -> 串口"}
+function maskName(mask){return mask==="100"?"红灯":mask==="010"?"黄灯":mask==="001"?"绿灯":mask==="000"?"全灭":mask==="111"?"全亮":mask}
+function bit(mask,i){return mask[i]==="1"}
+function activePreviewMask(){
+  if(!backlightOn)return "000";
+  const now=Date.now();
+  if(previewMode.type==="steps"&&Array.isArray(previewMode.steps)&&previewMode.steps.length){
+    const steps=previewMode.steps.filter(s=>s&&s.mask!=null&&s.ms!=null).map(s=>({mask:String(s.mask).padStart(3,"0").slice(0,3),ms:Math.max(20,parseInt(s.ms)||20)}));
+    const total=steps.reduce((n,s)=>n+s.ms,0); let t=(now-previewStartedAt)%Math.max(total,1);
+    for(const s of steps){if(t<s.ms)return s.mask;t-=s.ms}
+    return steps[0]?.mask||"000";
+  }
+  if(previewMode.type==="pattern"){
+    const p=previewMode.pattern, period=Math.max(20,customPeriod), tick=Math.floor((now-previewStartedAt)/period);
+    if(p==="steady")return ledMask;
+    if(p==="blink")return tick%2===0?ledMask:"000";
+    if(p==="chase"){const order=[0,1,2].filter(i=>bit(ledMask,i)); if(!order.length)return "000"; return ["0","0","0"].map((v,i)=>i===order[tick%order.length]?"1":"0").join("");}
+    if(p==="alternate")return tick%2===0?["1","0","1"].map((v,i)=>bit(ledMask,i)?v:"0").join(""):["0",bit(ledMask,1)?"1":"0","0"].join("");
+    if(p==="pair_chase"){const pairs=["110","011","101"]; return pairs[tick%3].split("").map((v,i)=>v==="1"&&bit(ledMask,i)?"1":"0").join("");}
+  }
+  return ledMask;
+}
+function renderSignal(){
+  const mask=activePreviewMask();
+  signalPreview.innerHTML=`<div class="signal-wrap"><div class="signal"><div class="lamp green ${bit(mask,2)?"on":""}"></div><div class="lamp yellow ${bit(mask,1)?"on":""}"></div><div class="lamp red ${bit(mask,0)?"on":""}"></div></div><div class="signal-status"><b>${maskName(mask)}</b><div class="metas">`+meta("当前灯位",mask)+meta("选择灯位",ledMask)+meta("周期",customPeriod+" ms")+meta("电源",backlightOn?"开启":"关闭")+`</div></div></div>`;
+}
+function compactDetail(v){return (v&&v.detail?v.detail:"").replace(/"/g,"")}
+function renderStatusBar(s){
+  const m=s.modules||{};
+  const items=[
+    ["Hub",m.hub||{status:"offline",detail:""},""],
+    ["Hook",m["codex-hook"]||{status:"missing",detail:""},""],
+    ["Watcher",m["codex-watcher"]||{status:"offline",detail:""},"codex-watcher"],
+    ["设备",m.esp32||{status:s.transport_status||"idle",detail:s.transport_message||""},""]
+  ];
+  statusBar.innerHTML=items.map(([label,v,restartName])=>{
+    const restart=restartName?`<button class="btn mini" onclick="restartModule('${restartName}')">Restart</button>`:"";
+    return `<div class="status-card"><div class="status-card-head"><span class="status-card-title">${label}</span><span class="status-card-actions">${restart}${pill(v.status)}</span></div><div class="status-card-detail" title="${compactDetail(v)}">${compactDetail(v)||"等待状态"}</div></div>`;
+  }).join("");
+}
 let selectorView="home";
 async function setTransport(mode){await post('/config',{transport:mode}); refresh();}
 function backSelectors(){selectorView="home"; refresh();}
 async function connectSerial(port){
   const result=await post('/connect',{transport:'serial',serial_port:port});
-  if(!result.ok){alert(result.error||result.message||'serial connect failed');}
+  if(!result.ok){alert(result.error||result.message||'串口连接失败');}
   refresh();
 }
 async function disconnectSerial(){await post('/disconnect',{transport:'serial'}); refresh();}
 async function clearSerial(){await post('/disconnect',{transport:'serial',clear:true}); refresh();}
 async function connectBle(address,name){
   const result=await post('/connect',{transport:'ble',ble_address:address,ble_name:name});
-  if(!result.ok){alert(result.error||result.message||'BLE connect failed');}
+  if(!result.ok){alert(result.error||result.message||'BLE 连接失败');}
   refresh();
 }
 async function disconnectBle(clear){await post('/disconnect',{transport:'ble',clear:!!clear}); refresh();}
 function renderSelectors(cfg){
   const mode=cfg.transport||"auto";
   selectors.innerHTML=
-    `<div class="sub">Mode</div>`+
-    `<button class="btn ${mode==="auto"?"ok":""}" onclick="setTransport('auto')">Auto BLE -> Serial</button>`+
-    `<button class="btn ${mode==="ble"?"ok":""}" onclick="setTransport('ble')">BLE only</button>`+
-    `<button class="btn ${mode==="serial"?"ok":""}" onclick="setTransport('serial')">Serial only</button>`+
-    `<div class="sub">Serial</div>`+
-    `<p>${pill(cfg.serial_connected?"connected":(cfg.serial_port?"selected":"idle"))} <span class="mono">${cfg.serial_port||"auto detect"}</span></p>`+
-    `<p class="muted">Connect holds the serial port open until Disconnect releases it.</p>`+
-    `<button class="btn" onclick="scanSerial()">Search serial</button>`+
-    `<button class="btn" onclick="connectSerial(null)">Connect auto serial</button>`+
-    `<button class="btn" onclick="disconnectSerial()">Disconnect serial</button>`+
-    `<button class="btn" onclick="clearSerial()">Clear serial</button>`+
+    `<div class="sub">模式</div>`+
+    `<button class="btn ${mode==="auto"?"ok":""}" onclick="setTransport('auto')">自动 BLE -> 串口</button>`+
+    `<button class="btn ${mode==="ble"?"ok":""}" onclick="setTransport('ble')">仅 BLE</button>`+
+    `<button class="btn ${mode==="serial"?"ok":""}" onclick="setTransport('serial')">仅串口</button>`+
+    `<div class="sub">串口</div>`+
+    `<p>${pill(cfg.serial_connected?"已连接":(cfg.serial_port?"已选择":"空闲"))} <span class="mono">${cfg.serial_port||"自动检测"}</span></p>`+
+    `<button class="btn" onclick="scanSerial()">搜索串口</button>`+
+    `<button class="btn" onclick="connectSerial(null)">自动连接串口</button>`+
+    `<button class="btn" onclick="disconnectSerial()">断开串口</button>`+
+    `<button class="btn" onclick="clearSerial()">清除选择</button>`+
     `<div class="sub">BLE</div>`+
-    `<p>${pill(cfg.ble_connected?"connected":(cfg.ble_address||cfg.ble_name?"selected":"idle"))} <span class="mono">${cfg.ble_name||"ClawdTank"} ${cfg.ble_address||""}</span></p>`+
-    `<button class="btn" onclick="scanBle()">Search BLE</button>`+
-    `<button class="btn" onclick="connectBle(null,null)">Connect BLE</button>`+
-    `<button class="btn" onclick="disconnectBle(false)">Disconnect BLE</button>`;
+    `<p>${pill(cfg.ble_connected?"已连接":(cfg.ble_address||cfg.ble_name?"已选择":"空闲"))} <span class="mono">${cfg.ble_name||"ClawdTank"} ${cfg.ble_address||""}</span></p>`+
+    `<button class="btn" onclick="scanBle()">搜索 BLE</button>`+
+    `<button class="btn" onclick="connectBle(null,null)">连接 BLE</button>`+
+    `<button class="btn" onclick="disconnectBle(false)">断开 BLE</button>`;
 }
 async function scanSerial(){
   selectorView="serial";
-  selectors.innerHTML='<p class="muted">Scanning serial...</p>';
+  selectors.innerHTML='<p class="muted">正在搜索串口...</p>';
   const rows=await (await fetch('/scan/serial')).json();
   const cfg=await (await fetch('/config')).json();
-  selectors.innerHTML='<div class="sub">Serial</div>'+
+  selectors.innerHTML='<div class="sub">串口</div>'+
     rows.map(r=>r.error?`<p class=bad>${r.error}</p>`:
-      `<p><button class="btn" onclick="connectSerial(${q(r.device)})">Connect / hold</button> ${selected(cfg.serial_port,r.device)?pill(cfg.serial_connected?"connected":"selected"):""} <b>${r.device}</b> ${r.suggested?'<span class=ok>ESP32</span> ':''}<span class="mono">${r.description||''} ${r.hwid||''}</span></p>`).join('')+
-    '<button class="btn" onclick="connectSerial(null)">Connect auto serial</button> <button class="btn" onclick="disconnectSerial()">Disconnect serial</button> <button class="btn" onclick="clearSerial()">Clear serial</button> <button class="btn" onclick="backSelectors()">Back</button>';
+      `<p><button class="btn" onclick="connectSerial(${q(r.device)})">连接并保持</button> ${selected(cfg.serial_port,r.device)?pill(cfg.serial_connected?"已连接":"已选择"):""} <b>${r.device}</b> ${r.suggested?'<span class=ok>ESP32</span> ':''}<span class="mono">${r.description||''} ${r.hwid||''}</span></p>`).join('')+
+    '<button class="btn" onclick="connectSerial(null)">自动连接串口</button> <button class="btn" onclick="disconnectSerial()">断开串口</button> <button class="btn" onclick="clearSerial()">清除选择</button> <button class="btn" onclick="backSelectors()">返回</button>';
 }
 async function scanBle(){
   selectorView="ble";
-  selectors.innerHTML='<p class="muted">Scanning BLE...</p>';
+  selectors.innerHTML='<p class="muted">正在搜索 BLE...</p>';
   const data=await (await fetch('/scan/ble')).json();
   if(!data.ok){selectors.innerHTML=`<p class=bad>${data.error}</p>`;return}
   const cfg=await (await fetch('/config')).json();
   selectors.innerHTML='<div class="sub">BLE</div>'+
-    data.devices.map(r=>`<p><button class="btn" onclick="connectBle(${q(r.address)},${q(r.name||'')})">Connect</button> ${selected(cfg.ble_address,r.address)?pill(cfg.ble_connected?"connected":"selected"):""} <b>${r.name||'(unnamed)'}</b> <span class="mono">${r.address} ${r.rssi??''}</span> ${r.suggested?'<span class=ok>target</span>':''}</p>`).join('')+
-    '<button class="btn" onclick="connectBle(null,null)">Connect BLE auto</button> <button class="btn" onclick="disconnectBle(false)">Disconnect BLE</button> <button class="btn" onclick="backSelectors()">Back</button>';
+    data.devices.map(r=>`<p><button class="btn" onclick="connectBle(${q(r.address)},${q(r.name||'')})">连接</button> ${selected(cfg.ble_address,r.address)?pill(cfg.ble_connected?"已连接":"已选择"):""} <b>${r.name||'(未命名)'}</b> <span class="mono">${r.address} ${r.rssi??''}</span> ${r.suggested?'<span class=ok>目标设备</span>':''}</p>`).join('')+
+    '<button class="btn" onclick="connectBle(null,null)">自动连接 BLE</button> <button class="btn" onclick="disconnectBle(false)">断开 BLE</button> <button class="btn" onclick="backSelectors()">返回</button>';
 }
 async function selectSerial(port){await post('/config',{serial_port:port}); refresh();}
 async function selectBle(address,name){await post('/config',{ble_address:address,ble_name:name}); refresh();}
 async function restartModule(name){
   const result=await post('/module/restart',{module:name});
-  if(!result.ok){alert(result.error||'restart failed');return}
-  if(name==='hub'){status.textContent='restarting'; setTimeout(refresh,2500); return}
+  if(!result.ok){alert(result.error||'重启失败');return}
+  if(name==='hub'){status.textContent='重启中'; setTimeout(refresh,2500); return}
   refresh();
 }
 async function refresh(){
   const s=await (await fetch('/state')).json();
   const cfg=await (await fetch('/config')).json();
   status.textContent=s.transport_status||"idle"; status.className="pill "+cls(s.transport_status);
-  current.innerHTML=`<div class="hero"><div class="hero-anim">${s.current_anim||"idle"}</div>${pill(s.transport_status)}</div>`+
-    `<div class="metas">`+meta("client",(s.current_client_id||"")+(s.current_client_kind?" / "+s.current_client_kind:""))+meta("source",s.current_source)+meta("event",s.current_event)+meta("tool",s.current_tool)+`</div>`;
-  document.querySelectorAll('#buttons .chip').forEach(b=>b.classList.toggle('active',b.dataset.a===s.current_anim));
-  const me=Object.entries(s.modules||{});
-  modules.innerHTML='<tr><th>Module</th><th>Status</th><th>Detail</th><th></th></tr>'+(me.length?me.map(([k,v])=>`<tr><td>${v.label||k}</td><td>${pill(v.status)}</td><td class="muted">${v.detail||""}</td><td>${v.restartable?`<button class="btn" onclick="restartModule('${k}')">Restart</button>`:""}</td></tr>`).join(""):none("no modules"));
+  renderStatusBar(s);
+  current.innerHTML=`<div class="hero"><div class="hero-anim">${s.current_anim||"待机"}</div>${pill(s.transport_status)}</div>`;
+  document.querySelectorAll('#buttons .chip').forEach(b=>b.classList.toggle('active',b.dataset.mask===ledMask));
   transport.innerHTML=`<div class="metas">`+
-    meta("mode",modeLabel(cfg.transport))+
-    meta("serial",cfg.serial_connected?`connected ${cfg.serial_port||""}`:(cfg.serial_port?`selected ${cfg.serial_port}`:"auto detect"))+
-    meta("BLE",`${cfg.ble_connected?"connected ":""}${cfg.ble_name||"ClawdTank"} ${cfg.ble_address||""}`)+
-    meta("last transport",s.transport)+meta("message",s.transport_message)+meta("latency",s.last_send_ms!=null?s.last_send_ms+" ms":null)+meta("delivered / failed",`<span class=ok>${s.delivered_count||0}</span> / <span class=bad>${s.failed_count||0}</span>`)+`</div>`;
+    meta("模式",modeLabel(cfg.transport))+
+    meta("串口",cfg.serial_connected?`已连接 ${cfg.serial_port||""}`:(cfg.serial_port?`已选择 ${cfg.serial_port}`:"自动检测"))+
+    meta("BLE",`${cfg.ble_connected?"已连接 ":""}${cfg.ble_name||"ClawdTank"} ${cfg.ble_address||""}`)+
+    meta("自定义灯效",cfg.use_status_effects?"已应用":"未应用")+
+    meta("最近通道",s.transport)+meta("消息",s.transport_message)+meta("延迟",s.last_send_ms!=null?s.last_send_ms+" ms":null)+`</div>`;
   if(selectorView==="home"){renderSelectors(cfg)}
-  const ce=Object.entries(s.clients||{});
-  clients.innerHTML='<tr><th>Client</th><th>Kind</th><th>Status</th><th>Anim</th><th>Event</th><th>OK / Fail</th></tr>'+(ce.length?ce.map(([k,v])=>`<tr><td>${k}</td><td class="muted">${v.kind||""}</td><td>${pill(v.status)}</td><td>${v.last_anim||""}</td><td class="muted">${v.last_event||""}</td><td><span class=ok>${v.delivered_count||0}</span> / <span class=bad>${v.failed_count||0}</span></td></tr>`).join(""):none("no clients yet"));
-  const hk=Object.values(Object.entries(s.hooks||{}).reduce((acc,[k,v])=>{const id=v.last_client_id||k;if(!acc[id]||v.last_at>acc[id].last_at)acc[id]=v;return acc},{}));
-  hooks.innerHTML='<tr><th>Client</th><th>Hook</th><th>Status</th><th>Anim</th><th>Tool</th><th>Source</th></tr>'+(hk.length?hk.map(v=>`<tr><td>${v.last_client_id||""}</td><td>${v.event||""}</td><td>${pill(v.status)}</td><td>${v.last_anim||""}</td><td class="muted">${v.last_tool||""}</td><td class="muted">${v.last_source||""}</td></tr>`).join(""):none("no hooks yet"));
-  const ev=await (await fetch('/events')).json();
-  events.innerHTML='<tr><th>Time</th><th>Client</th><th>Source</th><th>Event</th><th>Anim</th><th>Status</th></tr>'+(ev.length?ev.slice(-40).reverse().map(e=>`<tr><td class="mono">${e.at}</td><td>${e.client_id||""}</td><td class="muted">${e.source}</td><td>${e.event}</td><td>${e.anim}</td><td>${pill(e.status)}</td></tr>`).join(""):none("no events yet"));
 }
 setInterval(refresh,1000); refresh();
+setInterval(renderSignal,120);
+renderEffectControls();
+renderSignal();
+loadStatusEffects();
 </script></main></body></html>"""
 
 
@@ -1061,6 +1347,8 @@ class HubHandler(BaseHTTPRequestHandler):
             self.send_json(self.hub.scan_ble())
         elif path == "/config":
             self.send_json(self.hub.config())
+        elif path == "/status-effects":
+            self.send_json(self.hub.status_effect_config())
         elif path == "/health":
             self.send_json({"ok": True, "pid": os.getpid()})
         else:
@@ -1079,6 +1367,8 @@ class HubHandler(BaseHTTPRequestHandler):
                 self.send_json(self.hub.deliver(data))
             elif path == "/config":
                 self.send_json(self.hub.update_config(data))
+            elif path == "/status-effects":
+                self.send_json(self.hub.update_status_effects(data))
             elif path == "/connect":
                 self.send_json(self.hub.connect_transport(data))
             elif path == "/disconnect":
